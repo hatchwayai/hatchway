@@ -1,0 +1,27 @@
+# frps server — bundles frps binary with a templated Hatchway frps config.
+# Uses the official frp release rather than building from source.
+
+FROM alpine:3.19
+
+ARG FRP_VERSION=v0.68.1
+ARG TARGETARCH
+
+RUN apk add --no-cache curl gettext && \
+    curl -fSL "https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/frp_0.68.1_linux_${TARGETARCH}.tar.gz" \
+    | tar xz -C /tmp && \
+    mv /tmp/frp_0.68.1_linux_${TARGETARCH}/frps /usr/local/bin/frps && \
+    rm -rf /tmp/frp_* && \
+    apk del curl
+
+COPY THIRD_PARTY_LICENSES /usr/local/share/licenses/frp/LICENSE
+COPY frps.toml.tmpl /etc/frp/frps.toml.tmpl
+COPY scripts/frps-entrypoint.sh /usr/local/bin/frps-entrypoint.sh
+RUN chmod +x /usr/local/bin/frps-entrypoint.sh
+
+RUN adduser -D -H frps && \
+    mkdir -p /var/run/frps && chown frps /var/run/frps
+USER frps
+
+EXPOSE 7000 8081
+
+ENTRYPOINT ["/usr/local/bin/frps-entrypoint.sh"]

@@ -1,0 +1,26 @@
+# frps.toml template — rendered into /etc/frp/frps.toml at container start.
+#
+# Variables substituted from the environment (see Dockerfile.frps entrypoint):
+#   HATCHWAY_FRPS_AUTH_TOKEN — frps↔frpc bootstrap secret. Returned to API
+#                              users so they can configure frpc. NOT a
+#                              defense-in-depth secret.
+#   HATCHWAY_PLUGIN_SECRET   — frps→hatchway-server plugin path secret.
+#                              Server-internal; never returned to API users.
+#                              Embedded in the plugin callback URL path.
+#   HATCHWAY_TUNNEL_DOMAIN   — wildcard subdomain root for tunnels.
+#
+# This file MAY be committed; the rendered output (frps.toml) is gitignored
+# because it contains resolved secrets.
+
+bindPort = 7000
+vhostHTTPPort = 8081
+subDomainHost = "${HATCHWAY_TUNNEL_DOMAIN}"
+
+auth.method = "token"
+auth.token = "${HATCHWAY_FRPS_AUTH_TOKEN}"
+
+[[httpPlugins]]
+name = "hatchway-control-plane"
+addr = "http://hatchway-server:9001"
+path = "/frp/plugin/${HATCHWAY_PLUGIN_SECRET}"
+ops = ["Login", "NewProxy", "CloseProxy", "NewUserConn"]

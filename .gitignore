@@ -1,0 +1,33 @@
+# Binaries
+dist/
+*.exe
+
+# Go
+*.o
+*.a
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime config (contains secrets); the .tmpl version is committed.
+frps.toml
+!frps.toml.tmpl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+*.test
+*.prof
+coverage.out

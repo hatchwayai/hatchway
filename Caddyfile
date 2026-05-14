@@ -1,0 +1,16 @@
+# Caddyfile — Hatchway reverse proxy configuration
+#
+# Replace example.com with your actual domain.
+# The DNS-01 challenge requires a custom Caddy build with the appropriate
+# DNS provider plugin (see Dockerfile.caddy).
+
+{$HATCHWAY_API_DOMAIN} {
+	reverse_proxy hatchway-server:9000
+}
+
+*.{$HATCHWAY_TUNNEL_DOMAIN} {
+	tls {
+		dns cloudflare {$CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy frps:8081
+}

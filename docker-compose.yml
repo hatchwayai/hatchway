@@ -1,0 +1,100 @@
+# Hatchway server deployment
+#
+# Prerequisites:
+#   1. Copy .env.example to .env and fill in the values
+#   2. Run: docker compose up -d
+#   3. Bootstrap: docker compose run --rm hatchway-server hatchway server init
+#
+# The plugin port (9001) is intentionally NOT published — it is only
+# reachable on the hatchway_internal network.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hatchway}
+      POSTGRES_USER: ${POSTGRES_USER:-hatchway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - hatchway_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hatchway}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  hatchway-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["server", "run"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-hatchway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hatchway}?sslmode=disable
+      HATCHWAY_DOMAIN: ${HATCHWAY_DOMAIN:?Set HATCHWAY_DOMAIN in .env}
+      HATCHWAY_API_DOMAIN: ${HATCHWAY_API_DOMAIN:-api.${HATCHWAY_DOMAIN}}
+      HATCHWAY_FRPS_DOMAIN: ${HATCHWAY_FRPS_DOMAIN:-frps.${HATCHWAY_DOMAIN}}
+      HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
+      HATCHWAY_API_ADDR: ":9000"
+      HATCHWAY_FRPS_PLUGIN_ADDR: ":9001"
+      HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET:?Set HATCHWAY_PLUGIN_SECRET in .env}
+      HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN:?Set HATCHWAY_FRPS_AUTH_TOKEN in .env}
+      HATCHWAY_MAX_CONCURRENT_TUNNELS: ${HATCHWAY_MAX_CONCURRENT_TUNNELS:-5}
+      HATCHWAY_MAX_TTL: ${HATCHWAY_MAX_TTL:-24h}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - hatchway_internal
+
+  frps:
+    build:
+      context: .
+      dockerfile: Dockerfile.frps
+    restart: unless-stopped
+    environment:
+      HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET:?Set HATCHWAY_PLUGIN_SECRET in .env}
+      HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN:?Set HATCHWAY_FRPS_AUTH_TOKEN in .env}
+      HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
+    ports:
+      - "7000:7000"
+      - "8081:8081"
+    networks:
+      - hatchway_internal
+    depends_on:
+      - hatchway-server
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    restart: unless-stopped
+    environment:
+      # Caddyfile reads {$HATCHWAY_API_DOMAIN} and {$HATCHWAY_TUNNEL_DOMAIN}
+      # at startup; if either is empty Caddy fails to parse the site blocks.
+      HATCHWAY_API_DOMAIN: ${HATCHWAY_API_DOMAIN:-api.${HATCHWAY_DOMAIN}}
+      HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - hatchway_internal
+    depends_on:
+      - hatchway-server
+      - frps
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  hatchway_internal:

@@ -1,0 +1,57 @@
+# .goreleaser.yml — Hatchway release configuration
+#
+# Client bundles include frpc for tunnel creation.
+# Server binary is standalone (frps runs as a separate container).
+#
+# Prerequisites:
+#   1. Run scripts/download-frp.sh to populate dist/frp/
+#   2. goreleaser release --snapshot (local) or goreleaser release (CI)
+
+version: 2
+
+builds:
+  - id: hatchway
+    main: ./cmd/hatchway
+    binary: hatchway
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: client
+    builds:
+      - hatchway
+    name_template: "hatchway_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - src: dist/frp/frpc_{{ .Os }}_{{ .Arch }}
+        dst: frpc
+        strip_parent: true
+    wrap_in_directory: true
+
+  - id: server
+    builds:
+      - hatchway
+    name_template: "hatchway-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: []
+    wrap_in_directory: true
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

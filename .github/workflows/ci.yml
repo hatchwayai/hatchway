@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+      - name: Lint
+        run: make lint
+
+      - name: Test
+        run: go test -short ./...
+
+      - name: Build
+        run: make build
+
+      - name: Fuzz (short)
+        run: go test ./internal/server/tunnels/ -run=^$ -fuzz=FuzzTunnelIDValidation -fuzztime=30s
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hatchway_test
+          POSTGRES_USER: hatchway
+          POSTGRES_PASSWORD: test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Migration test
+        run: go test ./internal/db/ -v -count=1
+        env:
+          DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
+
+      - name: Integration tests — server packages
+        env:
+          DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
+        # -p 1 forces packages to run sequentially. The tunnels and plugin
+        # integration fixtures both do `DELETE FROM <all tables>` at setup —
+        # safe in isolation but a guaranteed FK-violation source if two
+        # packages run concurrently against the same Postgres.
+        run: go test -count=1 -p 1 -timeout 300s ./internal/server/...
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
+        # --yes skips the interactive confirmation that --force triggers when
+        # users already exist. The earlier Integration tests step leaves rows
+        # behind, so init needs --force every time CI runs this step.
+        run: go run ./cmd/hatchway server init --force --yes
+
+      - name: Integration test — CRUD endpoints
+        env:
+          HATCHWAY_SERVER: http://localhost:9000
+        run: |
+          set -euo pipefail
+          DATABASE_URL=postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable \
+          HATCHWAY_PLUGIN_SECRET=test-secret \
+          HATCHWAY_FRPS_AUTH_TOKEN=test-frps-token \
+          HATCHWAY_DOMAIN=test.local \
+          HATCHWAY_TUNNEL_DOMAIN=tunnel.test.local \
+          go run ./cmd/hatchway server run &
+          SERVER_PID=$!
+          trap 'kill "${SERVER_PID}" 2>/dev/null || true; wait "${SERVER_PID}" 2>/dev/null || true' EXIT
+
+          # Poll /healthz instead of sleeping; bound the wait so we don't
+          # hang the job if the server crashes on boot.
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/healthz >/dev/null; then
+              break
+            fi
+            if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+              echo "server exited before healthz came up" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl -sf http://localhost:9000/healthz
+          curl -sf http://localhost:9000/readyz
+
+          echo "Integration health checks passed"
