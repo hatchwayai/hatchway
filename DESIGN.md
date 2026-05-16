@@ -227,7 +227,7 @@ Non-obvious constraints that must be preserved in implementation. These are the 
 - **Auth layering with frp**: frp's `auth.token` is a global bootstrap secret (not a security boundary). The per-tunnel runtime token is the real ownership check, validated in the `Login` and `NewProxy` plugin callbacks.
 - **Tunnel ID format**: `t-` prefix + 16 chars from Crockford alphabet `abcdefghjkmnpqrstuvwxyz23456789`. No underscores (DNS-label illegal), no confusable characters (`0 Oli u`).
 - **Token storage**: prefix (for index lookup) + hash (for verification). Never store plaintext tokens.
-- **Plugin endpoint isolation**: `:9001` must never be exposed publicly — it authorizes frps callbacks. Only reachable on the internal Docker network, protected by `HATCHWAY_PLUGIN_SECRET`.
+- **Plugin endpoint isolation**: `:9001` must never be exposed publicly — it authorizes frps callbacks. Only reachable on the internal Docker network. Protected by path-based secret (`/frp/plugin/{secret}`) as defense-in-depth against accidental network misconfiguration.
 - **Tunnel lifecycle state machine**: `reserved → active → closed → active` (reconnect loop). `expired` and `revoked` are terminal. All status writes go through a single `Transition()` function.
 - **Idempotency**: `POST /v1/tunnels` supports `Idempotency-Key` header; `(token_id, key) → response` cached for 24h. Cached response body capped at 4 KB.
 
@@ -292,7 +292,7 @@ services:
 
   hatchway-server:
     image: hatchway:latest
-    command: ["hatchway", "server", "run"]
+    command: ["server", "run"]
     environment:
       DATABASE_URL: postgres://hatchway:hatchway_dev_password@postgres:5432/hatchway?sslmode=disable
       HATCHWAY_DOMAIN: example.com
@@ -301,6 +301,8 @@ services:
       HATCHWAY_TUNNEL_DOMAIN: tunnel.example.com
       HATCHWAY_API_ADDR: :9000
       HATCHWAY_FRPS_PLUGIN_ADDR: :9001
+      HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET}
+      HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN}
     depends_on:
       - postgres
     networks:
@@ -308,9 +310,10 @@ services:
 
   frps:
     image: hatchway-frps:latest
-    command: ["frps", "-c", "/etc/frp/frps.toml"]
-    volumes:
-      - ./frps.toml:/etc/frp/frps.toml:ro
+    environment:
+      HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET}
+      HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN}
+      HATCHWAY_TUNNEL_DOMAIN: tunnel.example.com
     ports:
       - "7000:7000"
     networks:
@@ -350,15 +353,26 @@ api.example.com {
 }
 
 *.tunnel.example.com {
+    tls {
+        dns cloudflare {$CLOUDFLARE_API_TOKEN}
+    }
     reverse_proxy frps:8081
 }
 ```
 
 Caddy only routes the public API port (`:9000`). The frps plugin port (`:9001`) is **never** routed by Caddy and is reachable only on the `hatchway_internal` Docker network. This is critical: the plugin endpoint authorizes frps callbacks and must not accept traffic from the public internet — exposing it would let anyone forge `Login` / `NewProxy` decisions and bypass tunnel ownership checks.
 
-As defense-in-depth, the plugin endpoint requires a shared secret header `X-Hatchway-Plugin-Secret`, set via `HATCHWAY_PLUGIN_SECRET` on both the Hatchway server and frps (passed as a plugin header). The handler rejects any request without a matching secret. This protects against accidental network misconfiguration without relying solely on network isolation.
+As defense-in-depth, the plugin endpoint requires a shared secret embedded in the URL path (`/frp/plugin/{secret}`), set via `HATCHWAY_PLUGIN_SECRET` on both the Hatchway server route and frps plugin config. The handler rejects any request where the path secret does not match. This protects against accidental network misconfiguration without relying solely on network isolation.
 
-For wildcard TLS, production deployments should use the DNS-01 challenge. The stock `caddy:latest` image cannot perform DNS-01 — you must build a custom Caddy image that includes the appropriate DNS provider plugin (for example, `caddy-dns/cloudflare`, `caddy-dns/route53`). The certificate is persisted in the `caddy_data` volume; back this up so renewals don't restart from scratch after a host migration.
+For wildcard TLS, production deployments must use the DNS-01 challenge (wildcard certificates cannot be obtained via HTTP-01). The stock `caddy:latest` image cannot perform DNS-01 — build a custom Caddy image that includes the appropriate DNS provider plugin (for example, `caddy-dns/cloudflare` for Cloudflare, `caddy-dns/route53` for AWS). The `CLOUDFLARE_API_TOKEN` environment variable is passed to the Caddy container. The certificate is persisted in the `caddy_data` volume; back this up so renewals don't restart from scratch after a host migration.
+
+The `caddy` service also needs the environment variable:
+
+```yaml
+  caddy:
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+```
 
 The `hatchway-server` and `frps` containers should run as non-root users. The `Dockerfile` should include a `USER nonroot` directive (or equivalent for the chosen base image). Do not run services as root inside containers.
 
@@ -496,18 +510,17 @@ auth.token = "<HATCHWAY_FRPS_AUTH_TOKEN>"
 [[httpPlugins]]
 name = "hatchway-control-plane"
 addr = "http://hatchway-server:9001"
-path = "/frp/plugin"
+path = "/frp/plugin/<HATCHWAY_PLUGIN_SECRET>"
 ops = ["Login", "NewProxy", "CloseProxy", "NewUserConn"]
-
-[httpPlugins.headers]
-X-Hatchway-Plugin-Secret = "<HATCHWAY_PLUGIN_SECRET>"
 ```
+
+frps does not support custom headers in the `httpPlugins` configuration. The plugin secret is therefore embedded in the callback URL path. The Hatchway server registers the route as `/frp/plugin/{secret}` and rejects any request where `{secret}` does not match `HATCHWAY_PLUGIN_SECRET`.
 
 ### Auth Layering
 
 frp's built-in `auth.token` is a single shared secret across all clients — it cannot be per-tunnel. Hatchway therefore uses two layers:
 
-1. **Bootstrap secret** — set via `HATCHWAY_FRPS_AUTH_TOKEN`, written into `auth.token` on both `frps` and `frpc`. It is global and rotates only when the operator rotates it. Its job is to keep random scanners from connecting to frps at all. It is **not** the security boundary for tunnel ownership. **Distinct from `HATCHWAY_PLUGIN_SECRET`** — the plugin secret is server-internal (frps→hatchway-server plugin header) and must never leak to API users.
+1. **Bootstrap secret** — set via `HATCHWAY_FRPS_AUTH_TOKEN`, written into `auth.token` on both `frps` and `frpc`. It is global and rotates only when the operator rotates it. Its job is to keep random scanners from connecting to frps at all. It is **not** the security boundary for tunnel ownership. **Distinct from `HATCHWAY_PLUGIN_SECRET`** — the plugin secret is server-internal (embedded in the frps plugin callback URL path) and must never leak to API users.
 2. **Runtime tunnel token** — per-tunnel, short-lived, generated by the Hatchway control plane and carried by frpc as `metadatas.runtime_token`. The plugin's `Login` callback validates this token against the `tunnel_runtime_tokens` table; `NewProxy` cross-checks that the proxy name and subdomain match the tunnel the token belongs to.
 
 The bootstrap secret is returned to clients in the tunnel-create response (`frp.server_token`) so the CLI can write it into the generated `frpc.toml`. Treat it like a public-but-rate-limited value: leakage lowers the cost of probing frps but does not let an attacker register a tunnel they don't own. The plugin secret is never returned via the API.
@@ -1013,10 +1026,15 @@ Optional:
 Recommended DNS:
 
 ```text
-api.example.com          -> server public IP
-frps.example.com         -> server public IP
-*.tunnel.example.com     -> server public IP
+api.example.com          -> server public IP  (can be behind Cloudflare proxy)
+frps.example.com         -> server public IP  (must NOT be behind proxy — raw TCP)
+*.tunnel.example.com     -> server public IP  (must NOT be behind proxy — Caddy serves cert directly)
 ```
+
+If using Cloudflare:
+- `api.example.com` can use orange cloud (proxied) — Cloudflare handles client-facing TLS.
+- `frps.example.com` and `*.tunnel.example.com` must use grey cloud (DNS only). Cloudflare cannot proxy raw TCP (port 7000) and its Universal SSL wildcard provisioning is unreliable for `*.tunnel` subdomains.
+- Cloudflare SSL/TLS mode must be set to **Full (strict)**. "Flexible" causes an infinite 308 redirect loop because Cloudflare connects to the origin on HTTP while Caddy redirects to HTTPS.
 
 Recommended TLS:
 

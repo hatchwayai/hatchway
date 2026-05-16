@@ -217,6 +217,38 @@ Source of truth for implementation progress. Edit checkboxes in place as you com
 - [ ] `/readyz` frps liveness check (TCP dial to frps:7000; currently only checks DB).
 - [ ] `hatchway status <tunnel_id>` client command (use `hatchway list` for now).
 
+### Security hardening: hide real IP behind Cloudflare
+
+`frps.example.com` and `*.tunnel.example.com` currently use grey cloud DNS, which exposes the server's real IP. These items improve the situation.
+
+#### Origin Certificate for tunnel traffic
+
+Replace the Let's Encrypt DNS-01 wildcard cert with a Cloudflare Origin Certificate for `*.tunnel.example.com`. This allows turning on orange cloud (proxy mode) for tunnel traffic.
+
+- [ ] Generate Cloudflare Origin Certificate (15-year validity) for `*.tunnel.example.com`
+- [ ] Mount cert/key into Caddy container
+- [ ] Update Caddyfile to use the origin cert instead of DNS-01 challenge
+- [ ] Turn on orange cloud for `*.tunnel.example.com` DNS record
+- [ ] Verify tunnel traffic flows through Cloudflare (check `cf-ray` header)
+- [ ] Remove `CLOUDFLARE_API_TOKEN` from `.env` and `Dockerfile.caddy` DNS plugin build (no longer needed for tunnel domain)
+- [ ] Update docs (README, self-host.md, DESIGN.md) to reflect new setup
+- [ ] Keep `CLOUDFLARE_API_TOKEN` option available as fallback for non-Cloudflare deployments
+
+#### frps port 7000 hardening
+
+Port 7000 must remain grey cloud since Cloudflare cannot proxy raw TCP. Mitigate exposure:
+
+- [ ] Add iptables connection rate limiting (max 10 new connections/sec, burst 20)
+- [ ] Enable frps TLS transport (`transport.tls.force = true`) to encrypt control channel
+- [ ] Document optional separate data plane VM deployment (frps + Caddy on a different IP)
+- [ ] Consider Cloudflare Spectrum as an enterprise option for TCP proxying
+
+#### General hardening
+
+- [ ] Document fail2ban rules for repeated frps auth failures
+- [ ] Add `HATCHWAY_FRPS_BIND_IP` option to restrict frps to a specific interface
+- [ ] Evaluate separate VM architecture: data plane VM (frps + Caddy) vs control plane VM (API + DB)
+
 ## Open questions (resolve before starting the relevant phase)
 
 - [x] Module path / GitHub owner for `go mod init` (Phase 0). → `github.com/zydo/hatchway`
