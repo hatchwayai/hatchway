@@ -9,6 +9,6 @@ set -eu
 
 OUT=/var/run/frps/frps.toml
 envsubst '${HATCHWAY_PLUGIN_SECRET} ${HATCHWAY_TUNNEL_DOMAIN} ${HATCHWAY_FRPS_AUTH_TOKEN}' \
-  < /etc/frp/frps.toml.tmpl > "${OUT}"
+	</etc/frp/frps.toml.tmpl >"${OUT}"
 
 exec frps -c "${OUT}"
