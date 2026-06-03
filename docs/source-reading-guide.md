@@ -188,8 +188,10 @@ DESIGN.md "Tunnel Lifecycle" diagram — they must match.
 `StartReaper` ticks every 30 s and does the only transition users can't
 trigger: `… → expired`. It uses `RETURNING id` so it can emit one event per
 expired tunnel without an extra round-trip. `StartSweepers` runs hourly and
-deletes `tunnel_events` older than `HATCHWAY_EVENTS_RETENTION_DAYS` and
-`idempotency_keys` older than `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS`.
+deletes `tunnel_events` older than `HATCHWAY_EVENTS_RETENTION_DAYS`,
+`idempotency_keys` older than `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS`, and
+runtime tokens that are dead (revoked or past `expires_at`) and beyond
+`HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS`.
 
 ## 4. Recommended reading order
 

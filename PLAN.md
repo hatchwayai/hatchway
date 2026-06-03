@@ -44,7 +44,7 @@ Source of truth for implementation progress. Edit checkboxes in place as you com
 - [x] Add `pgx/v5` dependency.
 - [x] `internal/db` package: connection pool, ping, transaction helpers.
 - [x] Migration `0001_init.sql`: `users`, `api_tokens`, `tunnels`, `tunnel_runtime_tokens`, `tunnel_events`, `idempotency_keys`. Match column types exactly to DESIGN.md. Note: `users.email` has a `UNIQUE` constraint; `tunnel_events.tunnel_id` is `NOT NULL`; `tunnels` has no `deleted_at` column (revoked status handles lifecycle).
-- [x] Indexes: `api_tokens(token_prefix)`, `tunnel_runtime_tokens(tunnel_id, token_prefix)`, `tunnels(user_id, status)`, `tunnels(expires_at) WHERE status IN ('reserved','active','closed')`, `tunnel_events(tunnel_id, created_at)`, `tunnel_events(created_at)` for the retention sweep.
+- [x] Indexes: `api_tokens(token_prefix)`, `tunnel_runtime_tokens(tunnel_id, token_prefix)` and `tunnel_runtime_tokens(token_prefix)` (the plugin's hot Login/NewProxy lookup is by prefix alone; the composite index is kept because `revokeRuntimeTokens` still filters by `tunnel_id` alone — see migration 0005), `tunnels(user_id, status)`, `tunnels(expires_at) WHERE status IN ('reserved','active','closed')`, `tunnel_events(tunnel_id, created_at)`, `tunnel_events(created_at)`, `idempotency_keys(created_at)` for the retention sweep.
 - [x] Migration `down` files for each `up`.
 - [x] Repository structs in `internal/models` for each table.
 - [x] Integration test harness that spins up Postgres via `testcontainers-go` (or a docker-compose fixture) and runs migrations up→down→up.

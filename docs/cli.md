@@ -319,6 +319,7 @@ tunnels are created but clients can't connect.
 | `HATCHWAY_FRPS_CONFIG_PATH`            | if `HATCHWAY_FRPS_MODE=subprocess` | — | Path to frps config file (subprocess mode) |
 | `HATCHWAY_EVENTS_RETENTION_DAYS`       | no       | `30`       | Tunnel events retention in days                        |
 | `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` | no       | `24`       | Idempotency key retention in hours                     |
+| `HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS`| no       | `7`        | Days dead (revoked/expired) runtime tokens are kept    |
 | `HATCHWAY_PLUGIN_TIMEOUT`              | no       | `2s`       | Per-call deadline for frps plugin handlers             |
 
 ### Docker Compose / Caddy only

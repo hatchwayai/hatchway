@@ -181,6 +181,7 @@ func baseValidConfig() *Config {
 		FRPSMode:                  "external",
 		EventsRetentionDays:       30,
 		IdempotencyRetentionHours: 24,
+		RuntimeTokenRetentionDays: 7,
 	}
 }
 
@@ -232,6 +233,7 @@ func TestValidate_NumericBounds(t *testing.T) {
 		{"zero EventsRetentionDays", func(c *Config) { c.EventsRetentionDays = 0 }, "EVENTS_RETENTION_DAYS"},
 		{"negative EventsRetentionDays", func(c *Config) { c.EventsRetentionDays = -1 }, "EVENTS_RETENTION_DAYS"},
 		{"zero IdempotencyRetentionHours", func(c *Config) { c.IdempotencyRetentionHours = 0 }, "IDEMPOTENCY_RETENTION_HOURS"},
+		{"zero RuntimeTokenRetentionDays", func(c *Config) { c.RuntimeTokenRetentionDays = 0 }, "RUNTIME_TOKEN_RETENTION_DAYS"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

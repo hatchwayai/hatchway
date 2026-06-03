@@ -29,6 +29,7 @@ type Config struct {
 	FRPSConfigPath            string // path to frps config (subprocess mode)
 	EventsRetentionDays       int
 	IdempotencyRetentionHours int
+	RuntimeTokenRetentionDays int
 }
 
 func Load() *Config {
@@ -53,6 +54,7 @@ func Load() *Config {
 		FRPSConfigPath:            envString("HATCHWAY_FRPS_CONFIG_PATH", ""),
 		EventsRetentionDays:       envInt("HATCHWAY_EVENTS_RETENTION_DAYS", 30),
 		IdempotencyRetentionHours: envInt("HATCHWAY_IDEMPOTENCY_RETENTION_HOURS", 24),
+		RuntimeTokenRetentionDays: envInt("HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS", 7),
 	}
 }
 
@@ -105,6 +107,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IdempotencyRetentionHours <= 0 {
 		return fmt.Errorf("HATCHWAY_IDEMPOTENCY_RETENTION_HOURS must be > 0, got %d", c.IdempotencyRetentionHours)
+	}
+	if c.RuntimeTokenRetentionDays <= 0 {
+		return fmt.Errorf("HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS must be > 0, got %d", c.RuntimeTokenRetentionDays)
 	}
 	return nil
 }

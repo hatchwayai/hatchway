@@ -183,7 +183,7 @@ func serverRunCmd() *cobra.Command {
 			}
 
 			go tunnels.StartReaper(ctx, database.Pool, 30*time.Second)
-			go tunnels.StartSweepers(ctx, database.Pool, cfg.EventsRetentionDays, cfg.IdempotencyRetentionHours)
+			go tunnels.StartSweepers(ctx, database.Pool, cfg.EventsRetentionDays, cfg.IdempotencyRetentionHours, cfg.RuntimeTokenRetentionDays)
 			var frpsProc *frp.Process
 			if cfg.FRPSMode == "subprocess" {
 				frpsProc = frp.NewProcess("frps", cfg.FRPSBinPath, []string{"-c", cfg.FRPSConfigPath})

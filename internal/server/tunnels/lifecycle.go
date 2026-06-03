@@ -139,11 +139,13 @@ func CountActiveTunnels(ctx context.Context, pool *pgxpool.Pool, userID string) 
 	return count, err
 }
 
-// StartSweepers runs periodic cleanup for tunnel_events and idempotency_keys.
-func StartSweepers(ctx context.Context, pool *pgxpool.Pool, eventsRetentionDays, idempotencyRetentionHours int) {
+// StartSweepers runs periodic cleanup for tunnel_events, idempotency_keys,
+// and dead runtime tokens.
+func StartSweepers(ctx context.Context, pool *pgxpool.Pool, eventsRetentionDays, idempotencyRetentionHours, runtimeTokenRetentionDays int) {
 	go runSweeper(ctx, time.Hour, func() {
 		sweepExpiredEvents(ctx, pool, eventsRetentionDays)
 		sweepIdempotencyKeys(ctx, pool, idempotencyRetentionHours)
+		sweepRuntimeTokens(ctx, pool, runtimeTokenRetentionDays)
 	})
 }
 
@@ -185,5 +187,25 @@ func sweepIdempotencyKeys(ctx context.Context, pool *pgxpool.Pool, retentionHour
 	}
 	if n := tag.RowsAffected(); n > 0 {
 		slog.Info("swept old idempotency_keys", "count", n, "retention_hours", retentionHours)
+	}
+}
+
+// sweepRuntimeTokens deletes runtime tokens that are no longer accepted by the
+// plugin (revoked OR past expires_at) and whose terminal event is older than
+// retentionDays. Live tokens — not revoked and not past expiry — are kept so
+// in-flight or recently-issued credentials are never removed.
+func sweepRuntimeTokens(ctx context.Context, pool *pgxpool.Pool, retentionDays int) {
+	tag, err := pool.Exec(ctx,
+		`DELETE FROM tunnel_runtime_tokens
+		  WHERE (revoked_at IS NOT NULL AND revoked_at < now() - $1::int * interval '1 day')
+		     OR (revoked_at IS NULL     AND expires_at < now() - $1::int * interval '1 day')`,
+		retentionDays,
+	)
+	if err != nil {
+		slog.Error("runtime tokens sweeper failed", "error", err)
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		slog.Info("swept old tunnel_runtime_tokens", "count", n, "retention_days", retentionDays)
 	}
 }

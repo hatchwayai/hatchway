@@ -269,6 +269,69 @@ func TestSweepers_KeepRecentRows(t *testing.T) {
 	}
 }
 
+func TestSweepRuntimeTokens(t *testing.T) {
+	pool, userID, _ := setupLifecyclePool(t)
+	ctx := context.Background()
+
+	tunnelID := "t-runtimetoksweep"
+	_, err := pool.Exec(ctx,
+		"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() + interval '1 hour')",
+		tunnelID, userID,
+	)
+	require.NoError(t, err)
+
+	type tokRow struct {
+		id        string
+		prefix    string
+		expiresAt string // SQL expression
+		revokedAt string // SQL expression or "NULL"
+	}
+	rows := []tokRow{
+		// Past retention: revoked 30 days ago.
+		{uuid.New().String(), "rt_oldrevoked", "now() + interval '1 hour'", "now() - interval '30 days'"},
+		// Past retention: expired 30 days ago, never revoked.
+		{uuid.New().String(), "rt_oldexpired", "now() - interval '30 days'", "NULL"},
+		// Recently dead (within retention): revoked 1 day ago.
+		{uuid.New().String(), "rt_recentrevoke", "now() + interval '1 hour'", "now() - interval '1 day'"},
+		// Live: not revoked, not yet expired.
+		{uuid.New().String(), "rt_live________", "now() + interval '1 hour'", "NULL"},
+	}
+	for _, r := range rows {
+		_, err := pool.Exec(ctx,
+			"INSERT INTO tunnel_runtime_tokens (id, tunnel_id, token_prefix, token_hash, expires_at, revoked_at) VALUES ($1, $2, $3, 'h', "+r.expiresAt+", "+r.revokedAt+")",
+			r.id, tunnelID, r.prefix,
+		)
+		require.NoError(t, err)
+	}
+
+	sweepRuntimeTokens(ctx, pool, 7)
+
+	var n int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM tunnel_runtime_tokens WHERE tunnel_id=$1", tunnelID).Scan(&n))
+	if n != 2 {
+		t.Fatalf("expected 2 surviving tokens (recent-revoke + live), got %d", n)
+	}
+
+	// Past-retention rows must be gone; recent-revoke and live must survive.
+	for _, r := range rows[:2] {
+		var exists bool
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM tunnel_runtime_tokens WHERE id=$1)", r.id).Scan(&exists))
+		if exists {
+			t.Errorf("expected token %s to be swept", r.prefix)
+		}
+	}
+	for _, r := range rows[2:] {
+		var exists bool
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT EXISTS(SELECT 1 FROM tunnel_runtime_tokens WHERE id=$1)", r.id).Scan(&exists))
+		if !exists {
+			t.Errorf("expected token %s to survive", r.prefix)
+		}
+	}
+}
+
 func TestCountActiveTunnels(t *testing.T) {
 	pool, userID, _ := setupLifecyclePool(t)
 	ctx := context.Background()

@@ -176,7 +176,7 @@ func TestStartSweepersDoesNotBlock(t *testing.T) {
 	// This would hang if StartSweepers blocks
 	done := make(chan struct{})
 	go func() {
-		StartSweepers(ctx, nil, 30, 24)
+		StartSweepers(ctx, nil, 30, 24, 7)
 		close(done)
 	}()
 	// Give it a moment
