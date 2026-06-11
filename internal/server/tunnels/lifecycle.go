@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zydo/hatchway/internal/server/api"
@@ -59,13 +60,17 @@ func Transition(ctx context.Context, pool *pgxpool.Pool, tunnelID string, event 
 	return nil
 }
 
-func emitEvent(ctx context.Context, pool *pgxpool.Pool, tunnelID, eventType, newStatus string) {
+type eventExec interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
+
+func emitEvent(ctx context.Context, db eventExec, tunnelID, eventType, newStatus string) {
 	payload, err := json.Marshal(map[string]string{"new_status": newStatus})
 	if err != nil {
 		slog.Error("marshal tunnel event payload failed", "tunnel_id", tunnelID, "error", err)
 		return
 	}
-	if _, err := pool.Exec(ctx,
+	if _, err := db.Exec(ctx,
 		"INSERT INTO tunnel_events (tunnel_id, event_type, payload) VALUES ($1, $2, $3)",
 		tunnelID, eventType, payload,
 	); err != nil && !errors.Is(err, context.Canceled) {

@@ -155,8 +155,14 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 
 		expiresAt := time.Now().Add(ttl)
 
-		// Insert tunnel
-		_, err = pool.Exec(r.Context(),
+		tx, err := pool.Begin(r.Context())
+		if err != nil {
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			return
+		}
+		defer tx.Rollback(r.Context())
+
+		_, err = tx.Exec(r.Context(),
 			"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, $3, $4, $5, 'reserved', $6)",
 			tunnelID, userID, req.Type, req.LocalHost, req.LocalPort, expiresAt,
 		)
@@ -165,8 +171,7 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		// Insert runtime token
-		_, err = pool.Exec(r.Context(),
+		_, err = tx.Exec(r.Context(),
 			"INSERT INTO tunnel_runtime_tokens (id, tunnel_id, token_prefix, token_hash, expires_at) VALUES ($1, $2, $3, $4, $5)",
 			uuid.New().String(), tunnelID, rt.Prefix, rt.Hash, expiresAt,
 		)
@@ -175,7 +180,11 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		emitEvent(r.Context(), pool, tunnelID, "created", "reserved")
+		emitEvent(r.Context(), tx, tunnelID, "created", "reserved")
+		if err := tx.Commit(r.Context()); err != nil {
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			return
+		}
 
 		resp := TunnelResponse{
 			TunnelID:     tunnelID,

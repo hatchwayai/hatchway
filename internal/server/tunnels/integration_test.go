@@ -260,6 +260,31 @@ func TestIntegration_CreateTunnelReturnsFRPSAuthToken(t *testing.T) {
 	}
 }
 
+func TestIntegration_CreateRollsBackWhenRuntimeTokenStoreFails(t *testing.T) {
+	f := setupFixture(t)
+	ctx := context.Background()
+
+	_, err := f.pool.Exec(ctx, "ALTER TABLE tunnel_runtime_tokens DROP CONSTRAINT IF EXISTS test_runtime_token_insert_blocked")
+	require.NoError(t, err)
+	_, err = f.pool.Exec(ctx, "ALTER TABLE tunnel_runtime_tokens ADD CONSTRAINT test_runtime_token_insert_blocked CHECK (false)")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "ALTER TABLE tunnel_runtime_tokens DROP CONSTRAINT IF EXISTS test_runtime_token_insert_blocked")
+	})
+
+	body := `{"type":"http","local_port":3000,"ttl_seconds":300}`
+	w := f.do(t, "POST", "/v1/tunnels", f.userToken, body, "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected token store failure to return 500, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var count int
+	require.NoError(t, f.pool.QueryRow(ctx, "SELECT COUNT(*) FROM tunnels WHERE user_id = $1", f.userID).Scan(&count))
+	if count != 0 {
+		t.Fatalf("failed create left %d tunnel row(s)", count)
+	}
+}
+
 func TestIntegration_IdempotencyReplay(t *testing.T) {
 	f := setupFixture(t)
 
