@@ -102,7 +102,7 @@ func TestCreateTunnel_InvalidLocalHost(t *testing.T) {
 }
 
 func TestCreateTunnel_TTLExceedsMax(t *testing.T) {
-	cfg := &config.Config{TunnelDomain: "tunnel.example.com", MaxTTL: 3600}
+	cfg := &config.Config{TunnelDomain: "tunnel.example.com", MaxTTL: time.Hour}
 	handler := CreateTunnel(nil, cfg)
 
 	w := httptest.NewRecorder()
@@ -112,6 +112,32 @@ func TestCreateTunnel_TTLExceedsMax(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for TTL exceeding max, got %d", w.Code)
+	}
+}
+
+func TestCreateTunnel_InvalidTTL(t *testing.T) {
+	cfg := &config.Config{TunnelDomain: "tunnel.example.com", MaxTTL: 24 * time.Hour}
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"negative", `{"type":"http","local_port":3000,"ttl_seconds":-1}`},
+		{"duration overflow", `{"type":"http","local_port":3000,"ttl_seconds":9223372037}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := CreateTunnel(nil, cfg)
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("POST", "/tunnels", strings.NewReader(tt.body))
+			r = r.WithContext(api.ContextWithAuth(r.Context(), "tok-1", "usr-1"))
+			handler.ServeHTTP(w, r)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("expected 400, got %d", w.Code)
+			}
+		})
 	}
 }
 

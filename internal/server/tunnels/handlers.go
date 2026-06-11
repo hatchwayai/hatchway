@@ -89,14 +89,18 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
+		if req.TTLSeconds < 0 {
+			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "ttl_seconds must be non-negative")
+			return
+		}
 		if req.TTLSeconds == 0 {
 			req.TTLSeconds = 3600
 		}
-		ttl := time.Duration(req.TTLSeconds) * time.Second
-		if ttl > cfg.MaxTTL {
+		if int64(req.TTLSeconds) > int64(cfg.MaxTTL/time.Second) {
 			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, fmt.Sprintf("ttl exceeds maximum of %s", cfg.MaxTTL))
 			return
 		}
+		ttl := time.Duration(req.TTLSeconds) * time.Second
 
 		// Check concurrent tunnel quota
 		count, err := CountActiveTunnels(r.Context(), pool, userID)
