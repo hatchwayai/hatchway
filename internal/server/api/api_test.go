@@ -71,6 +71,25 @@ func TestReadyzHandler_Unhealthy(t *testing.T) {
 	}
 }
 
+func TestStatusRecorder_DefaultStatusOnWrite(t *testing.T) {
+	w := httptest.NewRecorder()
+	rec := &statusRecorder{ResponseWriter: w}
+
+	n, err := rec.Write([]byte("ok"))
+	if err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("short write: got %d", n)
+	}
+	if rec.status != http.StatusOK {
+		t.Errorf("recorder status = %d, want 200", rec.status)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("response status = %d, want 200", w.Code)
+	}
+}
+
 // --- Auth middleware tests ---
 
 type mockLookup struct {
