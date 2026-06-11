@@ -89,6 +89,9 @@ func (c *Config) Validate() error {
 	if c.PluginTimeout <= 0 {
 		return fmt.Errorf("HATCHWAY_PLUGIN_TIMEOUT must be > 0, got %s", c.PluginTimeout)
 	}
+	if c.RateCreatePerMin <= 0 {
+		return fmt.Errorf("HATCHWAY_RATE_CREATE_PER_MIN must be > 0, got %d", c.RateCreatePerMin)
+	}
 	if c.FRPSMode != "external" && c.FRPSMode != "subprocess" {
 		return fmt.Errorf("HATCHWAY_FRPS_MODE must be 'external' or 'subprocess', got %q", c.FRPSMode)
 	}

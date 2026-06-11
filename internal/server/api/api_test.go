@@ -328,32 +328,49 @@ func TestRateLimiter_IndependentKeys(t *testing.T) {
 	}
 }
 
-func TestRateLimitMiddleware(t *testing.T) {
+func TestRateLimitMiddleware_RateLimitsTunnelCreation(t *testing.T) {
 	rl := NewRateLimiter(1)
 
-	// First request: inject token_id into context
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 
 	wrapped := RateLimitMiddleware(rl)(handler)
 
-	// First request with context
-	r1 := httptest.NewRequest("GET", "/v1/me", nil)
+	r1 := httptest.NewRequest("POST", "/v1/tunnels", nil)
 	r1 = r1.WithContext(ContextWithAuth(r1.Context(), "tok-1", "user-1"))
 	w1 := httptest.NewRecorder()
 	wrapped.ServeHTTP(w1, r1)
 	if w1.Code != http.StatusOK {
-		t.Errorf("first request should succeed, got %d", w1.Code)
+		t.Errorf("first create request should succeed, got %d", w1.Code)
 	}
 
-	// Second request: should be rate limited
-	r2 := httptest.NewRequest("GET", "/v1/me", nil)
+	r2 := httptest.NewRequest("POST", "/v1/tunnels", nil)
 	r2 = r2.WithContext(ContextWithAuth(r2.Context(), "tok-1", "user-1"))
 	w2 := httptest.NewRecorder()
 	wrapped.ServeHTTP(w2, r2)
 	if w2.Code != http.StatusTooManyRequests {
-		t.Errorf("second request should be rate limited, got %d", w2.Code)
+		t.Errorf("second create request should be rate limited, got %d", w2.Code)
+	}
+}
+
+func TestRateLimitMiddleware_SkipsReadRequests(t *testing.T) {
+	rl := NewRateLimiter(1)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	wrapped := RateLimitMiddleware(rl)(handler)
+
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/v1/me", nil)
+		r = r.WithContext(ContextWithAuth(r.Context(), "tok-1", "user-1"))
+		w := httptest.NewRecorder()
+		wrapped.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("read request %d should not be rate limited, got %d", i+1, w.Code)
+		}
 	}
 }
 

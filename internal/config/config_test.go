@@ -167,15 +167,16 @@ func TestEnvInt(t *testing.T) {
 
 func baseValidConfig() *Config {
 	return &Config{
-		DatabaseURL:     "postgres://localhost/x",
-		PluginSecret:    "p",
-		FRPSAuthToken:   "a",
-		TunnelDomain:    "tunnel.example.com",
-		PluginTimeout:   2 * time.Second,
-		MaxConcurrent:   5,
-		MaxTTL:          time.Hour,
-		MaxRequestBytes: 1024,
-		FRPSMode:        "external",
+		DatabaseURL:      "postgres://localhost/x",
+		PluginSecret:     "p",
+		FRPSAuthToken:    "a",
+		TunnelDomain:     "tunnel.example.com",
+		PluginTimeout:    2 * time.Second,
+		MaxConcurrent:    5,
+		MaxTTL:           time.Hour,
+		RateCreatePerMin: 10,
+		MaxRequestBytes:  1024,
+		FRPSMode:         "external",
 	}
 }
 
@@ -220,6 +221,7 @@ func TestValidate_NumericBounds(t *testing.T) {
 		{"zero MaxConcurrent", func(c *Config) { c.MaxConcurrent = 0 }, "MAX_CONCURRENT"},
 		{"zero MaxTTL", func(c *Config) { c.MaxTTL = 0 }, "MAX_TTL"},
 		{"zero PluginTimeout", func(c *Config) { c.PluginTimeout = 0 }, "PLUGIN_TIMEOUT"},
+		{"zero RateCreatePerMin", func(c *Config) { c.RateCreatePerMin = 0 }, "RATE_CREATE_PER_MIN"},
 		{"zero MaxRequestBytes", func(c *Config) { c.MaxRequestBytes = 0 }, "MAX_REQUEST_BYTES"},
 		{"bad FRPSMode", func(c *Config) { c.FRPSMode = "weird" }, "FRPS_MODE"},
 	}

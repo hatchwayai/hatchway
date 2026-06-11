@@ -75,6 +75,11 @@ func (rl *RateLimiter) cleanupLoop() {
 func RateLimitMiddleware(rl *RateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !requestNeedsRateLimit(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			tokenID := TokenIDFromContext(r.Context())
 			if tokenID == "" {
 				next.ServeHTTP(w, r)
@@ -90,4 +95,8 @@ func RateLimitMiddleware(rl *RateLimiter) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func requestNeedsRateLimit(r *http.Request) bool {
+	return r.Method == http.MethodPost && r.URL.Path == "/v1/tunnels"
 }
