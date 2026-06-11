@@ -203,6 +203,25 @@ func TestIdempotencyMiddleware_WithTokenID_NilPool(t *testing.T) {
 	handler.ServeHTTP(w, r)
 }
 
+func TestIdempotencyMiddleware_BodyTooLarge(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("handler should not run for an oversized idempotent request")
+	})
+
+	handler := IdempotencyMiddleware(nil)(inner)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{"too":"large"}`))
+	r.Header.Set("Idempotency-Key", "key-123")
+	r = r.WithContext(ContextWithAuth(r.Context(), "tok-1", "usr-1"))
+	r.Body = http.MaxBytesReader(w, r.Body, 5)
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d", w.Code)
+	}
+}
+
 func TestIdempotencyMiddleware_IgnoresEmptyKey(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

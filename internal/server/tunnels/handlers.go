@@ -69,6 +69,11 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 
 		var req CreateTunnelRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				api.WriteError(w, http.StatusRequestEntityTooLarge, api.ErrInvalidRequest, "request body too large")
+				return
+			}
 			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "invalid JSON body")
 			return
 		}

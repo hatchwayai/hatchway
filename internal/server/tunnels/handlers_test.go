@@ -41,6 +41,21 @@ func TestCreateTunnel_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestCreateTunnel_BodyTooLarge(t *testing.T) {
+	cfg := &config.Config{TunnelDomain: "tunnel.example.com"}
+	handler := CreateTunnel(nil, cfg)
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/tunnels", strings.NewReader(`{"type":"http","local_port":3000}`))
+	r.Body = http.MaxBytesReader(w, r.Body, 5)
+	r = r.WithContext(api.ContextWithAuth(r.Context(), "tok-1", "usr-1"))
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413 for oversized body, got %d", w.Code)
+	}
+}
+
 func TestCreateTunnel_InvalidType(t *testing.T) {
 	cfg := &config.Config{TunnelDomain: "tunnel.example.com"}
 	handler := CreateTunnel(nil, cfg)

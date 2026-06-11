@@ -493,11 +493,8 @@ func TestIntegration_BodySizeCap(t *testing.T) {
 
 	huge := `{"type":"http","local_port":3000,"ttl_seconds":300,"junk":"` + strings.Repeat("x", 200) + `"}`
 	w := f.do(t, "POST", "/v1/tunnels", f.userToken, huge, "")
-	// MaxBytesReader returns an error; the handler surfaces 400 (invalid JSON)
-	// or 500 depending on whether the decoder or the idempotency reader trips
-	// first. Either way it must NOT be 201.
-	if w.Code == http.StatusCreated {
-		t.Errorf("oversize body should not succeed, got 201")
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversize body should return 413, got %d", w.Code)
 	}
 }
 

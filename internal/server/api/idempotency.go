@@ -58,6 +58,11 @@ func handleIdempotentRequest(w http.ResponseWriter, r *http.Request, pool *pgxpo
 
 	hashStr, err := requestHashAndRestoreBody(r)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			WriteError(w, http.StatusRequestEntityTooLarge, ErrInvalidRequest, "request body too large")
+			return
+		}
 		WriteError(w, http.StatusInternalServerError, ErrInternal, "failed to read request body")
 		return
 	}
