@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hatchway_logo.svg" alt="Hatchway" width="480">
+  <img src="https://raw.githubusercontent.com/zydo/hatchway/main/docs/assets/hatchway_logo.svg" alt="Hatchway" width="480">
 </p>
 
 [![CI](https://github.com/zydo/hatchway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zydo/hatchway/actions/workflows/ci.yml)
