@@ -366,6 +366,45 @@ func TestIntegration_GetTunnelHappyAndNotFound(t *testing.T) {
 	}
 }
 
+// withHiddenTunnelsTable renames the tunnels table away for the duration of
+// the test so an ownership/status lookup fails with something other than
+// pgx.ErrNoRows — regression coverage for the bug where GetTunnel,
+// DeleteTunnel, and AdminRevokeTunnel all collapsed any query error
+// (including real outages) into a 404. api_tokens/users are untouched, so
+// AuthMiddleware's own lookup still succeeds and the request reaches the
+// handler under test.
+func withHiddenTunnelsTable(t *testing.T, f *fixture) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := f.pool.Exec(ctx, "ALTER TABLE tunnels RENAME TO tunnels_hidden_for_test")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(ctx, "ALTER TABLE tunnels_hidden_for_test RENAME TO tunnels")
+	})
+}
+
+func requireInternalError(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Error struct{ Code string } `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	if resp.Error.Code != "INTERNAL" {
+		t.Errorf("error code = %s, want INTERNAL", resp.Error.Code)
+	}
+}
+
+func TestIntegration_GetTunnelDBErrorReturns500(t *testing.T) {
+	f := setupFixture(t)
+	withHiddenTunnelsTable(t, f)
+
+	w := f.do(t, "GET", "/v1/tunnels/t-doesnotexist00", f.userToken, "", "")
+	requireInternalError(t, w)
+}
+
 func TestIntegration_CreateRespectsQuota(t *testing.T) {
 	f := setupFixture(t)
 	prev := f.cfg.MaxConcurrent
@@ -405,6 +444,22 @@ func TestIntegration_AdminRevokeNotFound(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404, got %d", w.Code)
 	}
+}
+
+func TestIntegration_AdminRevokeDBErrorReturns500(t *testing.T) {
+	f := setupFixture(t)
+	withHiddenTunnelsTable(t, f)
+
+	w := f.do(t, "POST", "/v1/admin/tunnels/t-doesnotexist00/revoke", f.adminToken, "", "")
+	requireInternalError(t, w)
+}
+
+func TestIntegration_DeleteTunnelDBErrorReturns500(t *testing.T) {
+	f := setupFixture(t)
+	withHiddenTunnelsTable(t, f)
+
+	w := f.do(t, "DELETE", "/v1/tunnels/t-doesnotexist00", f.userToken, "", "")
+	requireInternalError(t, w)
 }
 
 func TestIntegration_AdminRevokeOnAlreadyRevokedIsIdempotent(t *testing.T) {
@@ -581,5 +636,38 @@ func TestIntegration_ListTunnelsCursorPagination(t *testing.T) {
 	w = f.do(t, "GET", "/v1/tunnels?cursor=not-base64!", f.userToken, "", "")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("bad cursor: expected 400, got %d", w.Code)
+	}
+}
+
+// TestIntegration_ListTunnelsInvalidLimitFallsBackToDefault covers the
+// limit-parsing branch in ListTunnels: non-numeric, zero, negative, and
+// over-max values should all silently fall back to defaultListLimit rather
+// than erroring or applying an out-of-range limit to the query.
+func TestIntegration_ListTunnelsInvalidLimitFallsBackToDefault(t *testing.T) {
+	f := setupFixture(t)
+
+	for i := range 3 {
+		id := "t-invlim0000000" + string(rune('a'+i))
+		_, err := f.pool.Exec(context.Background(),
+			"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() + interval '1 hour')",
+			id, f.userID,
+		)
+		require.NoError(t, err)
+	}
+
+	type listResp struct {
+		Tunnels []map[string]any `json:"tunnels"`
+	}
+
+	for _, q := range []string{"limit=0", "limit=-1", "limit=101", "limit=not-a-number"} {
+		w := f.do(t, "GET", "/v1/tunnels?"+q, f.userToken, "", "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: expected 200, got %d body=%s", q, w.Code, w.Body.String())
+		}
+		var page listResp
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &page))
+		if len(page.Tunnels) != 3 {
+			t.Errorf("%s: expected all 3 tunnels (default limit), got %d", q, len(page.Tunnels))
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zydo/hatchway/internal/config"
 	"github.com/zydo/hatchway/internal/server/api"
@@ -160,7 +161,7 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
 			return
 		}
-		defer tx.Rollback(r.Context())
+		defer func() { _ = tx.Rollback(r.Context()) }()
 
 		_, err = tx.Exec(r.Context(),
 			"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, $3, $4, $5, 'reserved', $6)",
@@ -190,7 +191,7 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			TunnelID:     tunnelID,
 			Status:       "reserved",
 			Type:         req.Type,
-			PublicURL:    fmt.Sprintf("https://%s.%s", tunnelID, cfg.TunnelDomain),
+			PublicURL:    publicURL(tunnelID, cfg.TunnelDomain),
 			ExpiresAt:    &expiresAt,
 			RuntimeToken: rt.Raw,
 			FRP: &FRPConfig{
@@ -209,7 +210,7 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(r.Context(), w, "create_tunnel", resp)
+		writeJSON(w, "create_tunnel", resp)
 	}
 }
 
@@ -305,7 +306,7 @@ func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "scan failed")
 				return
 			}
-			e.t.PublicURL = fmt.Sprintf("https://%s.%s", e.t.TunnelID, cfg.TunnelDomain)
+			e.t.PublicURL = publicURL(e.t.TunnelID, cfg.TunnelDomain)
 			entries = append(entries, e)
 		}
 
@@ -322,7 +323,7 @@ func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(r.Context(), w, "list_tunnels", map[string]any{
+		writeJSON(w, "list_tunnels", map[string]any{
 			"tunnels":     result,
 			"next_cursor": nextCursor,
 		})
@@ -341,14 +342,19 @@ func GetTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 		).Scan(&t.TunnelID, &t.Type, &t.Status, &t.ExpiresAt)
 
 		if err != nil {
-			api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
+			if errors.Is(err, pgx.ErrNoRows) {
+				api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
+			} else {
+				slog.Error("get tunnel query failed", "error", err, "tunnel_id", tunnelID)
+				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
+			}
 			return
 		}
 
-		t.PublicURL = fmt.Sprintf("https://%s.%s", t.TunnelID, cfg.TunnelDomain)
+		t.PublicURL = publicURL(t.TunnelID, cfg.TunnelDomain)
 
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(r.Context(), w, "get_tunnel", t)
+		writeJSON(w, "get_tunnel", t)
 	}
 }
 
@@ -361,7 +367,16 @@ func DeleteTunnel(pool *pgxpool.Pool) http.HandlerFunc {
 		err := pool.QueryRow(r.Context(),
 			"SELECT user_id, status FROM tunnels WHERE id = $1", tunnelID,
 		).Scan(&owner, &status)
-		if err != nil || owner != userID {
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
+			} else {
+				slog.Error("delete tunnel lookup failed", "error", err, "tunnel_id", tunnelID)
+				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
+			}
+			return
+		}
+		if owner != userID {
 			api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
 			return
 		}
@@ -393,7 +408,12 @@ func AdminRevokeTunnel(pool *pgxpool.Pool) http.HandlerFunc {
 		var status string
 		err := pool.QueryRow(r.Context(), "SELECT status FROM tunnels WHERE id = $1", tunnelID).Scan(&status)
 		if err != nil {
-			api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
+			if errors.Is(err, pgx.ErrNoRows) {
+				api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
+			} else {
+				slog.Error("admin revoke lookup failed", "error", err, "tunnel_id", tunnelID)
+				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
+			}
 			return
 		}
 
@@ -426,9 +446,14 @@ func revokeRuntimeTokens(ctx context.Context, pool *pgxpool.Pool, tunnelID strin
 // writeJSON encodes v as JSON and logs an error if the encoder fails. Status
 // has already been written by the caller — failure here can't be turned into
 // a 5xx, so this exists purely so silent encoder failures don't go unnoticed.
-func writeJSON(ctx context.Context, w http.ResponseWriter, op string, v any) {
+func writeJSON(w http.ResponseWriter, op string, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("response encode failed", "op", op, "error", err)
 	}
-	_ = ctx
+}
+
+// publicURL builds the public HTTPS URL for a tunnel from its ID and the
+// configured tunnel domain.
+func publicURL(tunnelID, tunnelDomain string) string {
+	return fmt.Sprintf("https://%s.%s", tunnelID, tunnelDomain)
 }
