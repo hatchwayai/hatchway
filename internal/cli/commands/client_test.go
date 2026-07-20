@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +117,28 @@ func TestAuthSetTokenRequiresServer(t *testing.T) {
 	serverFlag := cmd.Flags().Lookup("server")
 	if serverFlag == nil {
 		t.Error("missing --server flag")
+	}
+}
+
+func TestAuthSetTokenFallsBackToServerEnvVar(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpDir)
+	t.Setenv("HATCHWAY_SERVER", "https://from-env.example.com")
+
+	cmd := authSetTokenCmd()
+	// No --server flag parsed, so the bound `server` var stays "" — this
+	// exercises the HATCHWAY_SERVER fallback the command's own error message
+	// claims to support.
+	if err := cmd.RunE(cmd, []string{"sk_live_test_token"}); err != nil {
+		t.Fatalf("RunE with HATCHWAY_SERVER set: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, "hatchway", "credentials.json"))
+	if err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if !strings.Contains(string(data), "from-env.example.com") {
+		t.Errorf("credentials file should contain the HATCHWAY_SERVER value, got %s", data)
 	}
 }
 

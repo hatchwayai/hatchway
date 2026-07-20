@@ -63,6 +63,9 @@ func authSetTokenCmd() *cobra.Command {
 				return fmt.Errorf("token is required")
 			}
 			if server == "" {
+				server = os.Getenv("HATCHWAY_SERVER")
+			}
+			if server == "" {
 				return fmt.Errorf("--server is required (or set HATCHWAY_SERVER)")
 			}
 
@@ -204,7 +207,7 @@ func httpCmd() *cobra.Command {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Warning: frpc not found in PATH. Tunnel is reserved but not connected.")
 				fmt.Fprintln(os.Stderr, "Install frp or use the tunnel manually with the config below:")
-				fmt.Println(frpcConfig)
+				fmt.Fprintln(os.Stderr, frpcConfig)
 				return nil
 			}
 
@@ -297,10 +300,9 @@ func listCmd() *cobra.Command {
 			}
 
 			if asJSON {
-				for _, t := range list.Tunnels {
-					fmt.Printf("%s\t%s\t%s\t%s\n", t.TunnelID, t.Type, t.Status, t.PublicURL)
-				}
-				return nil
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(list.Tunnels)
 			}
 
 			if len(list.Tunnels) == 0 {

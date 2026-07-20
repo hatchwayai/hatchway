@@ -91,28 +91,38 @@ func serverInitCmd() *cobra.Command {
 				}
 			}
 
-			// Create admin user
-			userID := uuid.New().String()
-			_, err = database.Pool.Exec(ctx,
-				"INSERT INTO users (id, email, name, is_admin) VALUES ($1, $2, $3, true)",
-				userID, adminEmail, adminName,
-			)
-			if err != nil {
-				return fmt.Errorf("create admin user: %w", err)
-			}
-
 			// Mint first API token
 			tok, err := tokens.MintAPIToken()
 			if err != nil {
 				return fmt.Errorf("mint token: %w", err)
 			}
 
-			_, err = database.Pool.Exec(ctx,
+			// Create the admin user and its token together — a failure
+			// between the two would otherwise leave an admin user with no
+			// usable token.
+			userID := uuid.New().String()
+			tx, err := database.Pool.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("begin transaction: %w", err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+
+			if _, err := tx.Exec(ctx,
+				"INSERT INTO users (id, email, name, is_admin) VALUES ($1, $2, $3, true)",
+				userID, adminEmail, adminName,
+			); err != nil {
+				return fmt.Errorf("create admin user: %w", err)
+			}
+
+			if _, err := tx.Exec(ctx,
 				"INSERT INTO api_tokens (id, user_id, name, token_prefix, token_hash) VALUES ($1, $2, $3, $4, $5)",
 				uuid.New().String(), userID, "init-token", tok.Prefix, tok.Hash,
-			)
-			if err != nil {
+			); err != nil {
 				return fmt.Errorf("store token: %w", err)
+			}
+
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit transaction: %w", err)
 			}
 
 			fmt.Fprintf(os.Stderr, "Admin user created: %s\n", adminEmail)
@@ -201,7 +211,7 @@ func serverUserCmd() *cobra.Command {
 		Short: "Manage users",
 	}
 
-	cmd.AddCommand(&cobra.Command{
+	createCmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a new user",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -236,12 +246,13 @@ func serverUserCmd() *cobra.Command {
 			fmt.Fprintf(os.Stderr, "User created (%s): %s (%s)\n", role, email, id)
 			return nil
 		},
-	})
-	cmd.Commands()[0].Flags().String("email", "", "User email")
-	cmd.Commands()[0].Flags().String("name", "", "User display name")
-	cmd.Commands()[0].Flags().Bool("admin", false, "Grant admin privileges")
+	}
+	createCmd.Flags().String("email", "", "User email")
+	createCmd.Flags().String("name", "", "User display name")
+	createCmd.Flags().Bool("admin", false, "Grant admin privileges")
+	cmd.AddCommand(createCmd)
 
-	cmd.AddCommand(&cobra.Command{
+	listCmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all users",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -253,7 +264,7 @@ func serverUserCmd() *cobra.Command {
 			}
 			defer database.Close()
 
-			rows, err := database.Pool.Query(ctx, "SELECT id, email, name, created_at FROM users ORDER BY created_at")
+			rows, err := database.Pool.Query(ctx, "SELECT id, email, name, is_admin, created_at FROM users ORDER BY created_at")
 			if err != nil {
 				return err
 			}
@@ -262,7 +273,7 @@ func serverUserCmd() *cobra.Command {
 			users := []models.User{}
 			for rows.Next() {
 				var u models.User
-				if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.CreatedAt); err != nil {
+				if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.IsAdmin, &u.CreatedAt); err != nil {
 					return err
 				}
 				users = append(users, u)
@@ -275,15 +286,16 @@ func serverUserCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tEMAIL\tNAME\tCREATED")
+			fmt.Fprintln(w, "ID\tEMAIL\tNAME\tADMIN\tCREATED")
 			for _, u := range users {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", u.ID[:8], ptrStr(u.Email), ptrStr(u.Name), u.CreatedAt.Format("2006-01-02"))
+				fmt.Fprintf(w, "%s\t%s\t%s\t%t\t%s\n", u.ID[:8], ptrStr(u.Email), ptrStr(u.Name), u.IsAdmin, u.CreatedAt.Format("2006-01-02"))
 			}
 			w.Flush()
 			return nil
 		},
-	})
-	cmd.Commands()[1].Flags().Bool("json", false, "Output as JSON")
+	}
+	listCmd.Flags().Bool("json", false, "Output as JSON")
+	cmd.AddCommand(listCmd)
 
 	return cmd
 }
@@ -294,7 +306,7 @@ func serverTokenCmd() *cobra.Command {
 		Short: "Manage API tokens",
 	}
 
-	cmd.AddCommand(&cobra.Command{
+	createCmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a new API token",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -337,9 +349,10 @@ func serverTokenCmd() *cobra.Command {
 			fmt.Println(tok.Raw)
 			return nil
 		},
-	})
-	cmd.Commands()[0].Flags().String("user", "", "User email or name")
-	cmd.Commands()[0].Flags().String("name", "", "Token label")
+	}
+	createCmd.Flags().String("user", "", "User email or name")
+	createCmd.Flags().String("name", "", "Token label")
+	cmd.AddCommand(createCmd)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "revoke <token_id>",
@@ -376,7 +389,7 @@ func serverTokenCmd() *cobra.Command {
 }
 
 func serverTunnelsCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "tunnels",
 		Short: "List tunnels (admin view across all users)",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -415,14 +428,14 @@ func serverTunnelsCmd() *cobra.Command {
 			for rows.Next() {
 				var id, userID, typ, status, localHost string
 				var localPort int
-				var expiresAt *string
-				var createdAt string
+				var expiresAt *time.Time
+				var createdAt time.Time
 				if err := rows.Scan(&id, &userID, &typ, &status, &localHost, &localPort, &expiresAt, &createdAt); err != nil {
 					return err
 				}
 				expires := "-"
 				if expiresAt != nil {
-					expires = *expiresAt
+					expires = expiresAt.Format(time.RFC3339)
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s:%d\t%s\n", id, userID[:8], typ, status, localHost, localPort, expires)
 			}
@@ -430,6 +443,8 @@ func serverTunnelsCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().Bool("json", false, "Output as JSON")
+	return cmd
 }
 
 func ptrStr(s *string) string {
