@@ -17,13 +17,16 @@ jobs:
           go-version: "1.26"
 
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        # Pinned: this repo's .golangci.yml uses the v1 config schema, which
+        # `@latest` will eventually resolve past (golangci-lint v2 changed
+        # the schema). Bump deliberately, not implicitly.
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
 
       - name: Lint
         run: make lint
 
       - name: Test
-        run: go test -short ./...
+        run: make test-short
 
       - name: Build
         run: make build
@@ -85,7 +88,7 @@ jobs:
           DATABASE_URL=postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable \
           HATCHWAY_PLUGIN_SECRET=test-secret \
           HATCHWAY_FRPS_AUTH_TOKEN=test-frps-token \
-          HATCHWAY_DOMAIN=test.local \
+          HATCHWAY_FRPS_DOMAIN=frps.test.local \
           HATCHWAY_TUNNEL_DOMAIN=tunnel.test.local \
           go run ./cmd/hatchway server run &
           SERVER_PID=$!
