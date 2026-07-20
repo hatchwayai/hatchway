@@ -13,20 +13,35 @@ import (
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// toMigrateURL converts a standard postgres:// URL to pgx5:// for golang-migrate.
+// toMigrateURL converts a standard postgres:// or postgresql:// URL to pgx5://
+// for golang-migrate, which registers its pgx v5 driver under that scheme.
 func toMigrateURL(databaseURL string) string {
-	return strings.Replace(databaseURL, "postgres://", "pgx5://", 1)
+	if rest, ok := strings.CutPrefix(databaseURL, "postgresql://"); ok {
+		return "pgx5://" + rest
+	}
+	if rest, ok := strings.CutPrefix(databaseURL, "postgres://"); ok {
+		return "pgx5://" + rest
+	}
+	return databaseURL
 }
 
-func RunMigrations(databaseURL string) error {
+func newMigrator(databaseURL string) (*migrate.Migrate, error) {
 	d, err := iofs.New(migrationFS, "migrations")
 	if err != nil {
-		return fmt.Errorf("create migration source: %w", err)
+		return nil, fmt.Errorf("create migration source: %w", err)
 	}
 
 	m, err := migrate.NewWithSourceInstance("iofs", d, toMigrateURL(databaseURL))
 	if err != nil {
-		return fmt.Errorf("create migrator: %w", err)
+		return nil, fmt.Errorf("create migrator: %w", err)
+	}
+	return m, nil
+}
+
+func RunMigrations(databaseURL string) error {
+	m, err := newMigrator(databaseURL)
+	if err != nil {
+		return err
 	}
 	defer m.Close()
 
@@ -37,14 +52,9 @@ func RunMigrations(databaseURL string) error {
 }
 
 func RunMigrationsDown(databaseURL string) error {
-	d, err := iofs.New(migrationFS, "migrations")
+	m, err := newMigrator(databaseURL)
 	if err != nil {
-		return fmt.Errorf("create migration source: %w", err)
-	}
-
-	m, err := migrate.NewWithSourceInstance("iofs", d, toMigrateURL(databaseURL))
-	if err != nil {
-		return fmt.Errorf("create migrator: %w", err)
+		return err
 	}
 	defer m.Close()
 
