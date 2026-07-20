@@ -134,9 +134,9 @@ t-abc3x7km9w2p4rng      http    active  https://t-abc3x7km9w2p4rng.tunnel.exampl
 
 **Flags**:
 
-| Flag     | Default | Description                    |
-| -------- | ------- | ------------------------------ |
-| `--json` | `false` | Output as tab-separated values |
+| Flag     | Default | Description    |
+| -------- | ------- | -------------- |
+| `--json` | `false` | Output as JSON |
 
 ### `hatchway delete <tunnel_id>`
 
@@ -165,8 +165,10 @@ Initialize the database and create the first admin user.
 
 ```bash
 $ hatchway server init
-Created admin user
-API token: sk_live_abc123def456...
+Migrations applied.
+Admin user created: admin@hatchway.local
+API token (save this — it won't be shown again):
+sk_live_abc123def456...
 ```
 
 **Flags**:
@@ -199,6 +201,12 @@ Starts two HTTP listeners:
 
 Graceful shutdown on SIGINT/SIGTERM with a 30-second drain deadline.
 
+**Flags**:
+
+| Flag    | Default | Description                                                          |
+| ------- | ------- | --------------------------------------------------------------------- |
+| `--dev` | `false` | Run frps as a subprocess instead of expecting an external instance.   |
+
 ### `hatchway server user create`
 
 Create a new user.
@@ -222,8 +230,8 @@ List all users.
 
 ```bash
 $ hatchway server user list
-ID                                      EMAIL               NAME
-550e8400-e29b-41d4-a716-446655440000    admin@example.com   Admin
+ID        EMAIL               NAME   ADMIN  CREATED
+550e8400  admin@example.com   Admin  true   2026-05-14
 ```
 
 **Flags**:
@@ -238,7 +246,8 @@ Create an API token for a user.
 
 ```bash
 $ hatchway server token create --user alice@example.com --name "laptop"
-API token: sk_live_xyz789...
+Token created. Save this — it won't be shown again:
+sk_live_xyz789...
 ```
 
 **Flags**:
@@ -284,25 +293,42 @@ $ hatchway server tunnels
 
 ### Server
 
-| Variable                               | Required | Default          | Description                                    |
-| -------------------------------------- | -------- | ---------------- | ---------------------------------------------- |
-| `DATABASE_URL`                         | yes      | —                | PostgreSQL connection string                   |
-| `HATCHWAY_DOMAIN`                      | yes      | —                | Top-level domain                               |
-| `HATCHWAY_PLUGIN_SECRET`               | yes      | —                | frps→server plugin auth header (internal)      |
-| `HATCHWAY_FRPS_AUTH_TOKEN`             | yes      | —                | frps↔frpc bootstrap secret (returned to users) |
-| `HATCHWAY_API_ADDR`                    | no       | `:9000`          | API server listen address                      |
-| `HATCHWAY_FRPS_PLUGIN_ADDR`            | no       | `:9001`          | Plugin server listen address                   |
-| `HATCHWAY_API_DOMAIN`                  | no       | `api.$DOMAIN`    | API subdomain                                  |
-| `HATCHWAY_FRPS_DOMAIN`                 | no       | `frps.$DOMAIN`   | frps subdomain                                 |
-| `HATCHWAY_TUNNEL_DOMAIN`               | no       | `tunnel.$DOMAIN` | Tunnel wildcard subdomain                      |
-| `HATCHWAY_MAX_CONCURRENT_TUNNELS`      | no       | `5`              | Max concurrent tunnels per user                |
-| `HATCHWAY_MAX_TTL`                     | no       | `24h`            | Maximum tunnel TTL                             |
-| `HATCHWAY_RATE_CREATE_PER_MIN`         | no       | `10`             | Tunnel creation rate limit per token           |
-| `HATCHWAY_API_READ_TIMEOUT`            | no       | `30s`            | API server read timeout                        |
-| `HATCHWAY_API_WRITE_TIMEOUT`           | no       | `30s`            | API server write timeout                       |
-| `HATCHWAY_LOG_USER_CONNS`              | no       | `false`          | Log individual user connections                |
-| `HATCHWAY_FRPS_MODE`                   | no       | `external`       | frps mode: `external` or `subprocess`          |
-| `HATCHWAY_FRPS_BIN_PATH`               | no       | `frps`           | Path to frps binary (subprocess mode)          |
-| `HATCHWAY_EVENTS_RETENTION_DAYS`       | no       | `30`             | Tunnel events retention in days                |
-| `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` | no       | `24`             | Idempotency key retention in hours             |
-| `HATCHWAY_PLUGIN_TIMEOUT`              | no       | `2s`             | Per-call deadline for frps plugin handlers     |
+These are read directly by the `hatchway` binary (`internal/config/config.go`).
+`HATCHWAY_FRPS_DOMAIN` is required because it's baked into the `serverAddr`
+returned to every `frpc` client in the tunnel-creation response — without it,
+tunnels are created but clients can't connect.
+
+| Variable                               | Required | Default    | Description                                          |
+| --------------------------------------- | -------- | ---------- | ----------------------------------------------------- |
+| `DATABASE_URL`                         | yes      | —          | PostgreSQL connection string                           |
+| `HATCHWAY_PLUGIN_SECRET`               | yes      | —          | frps→server plugin auth header (internal)              |
+| `HATCHWAY_FRPS_AUTH_TOKEN`             | yes      | —          | frps↔frpc bootstrap secret (returned to users)         |
+| `HATCHWAY_FRPS_DOMAIN`                 | yes      | —          | Hostname `frpc` connects to (frps's public address)    |
+| `HATCHWAY_TUNNEL_DOMAIN`               | no       | `tunnel.example.com` | Tunnel wildcard subdomain                    |
+| `HATCHWAY_API_ADDR`                    | no       | `:9000`    | API server listen address                              |
+| `HATCHWAY_FRPS_PLUGIN_ADDR`            | no       | `:9001`    | Plugin server listen address                           |
+| `HATCHWAY_MAX_CONCURRENT_TUNNELS`      | no       | `5`        | Max concurrent tunnels per user                        |
+| `HATCHWAY_MAX_TTL`                     | no       | `24h`      | Maximum tunnel TTL                                     |
+| `HATCHWAY_RATE_CREATE_PER_MIN`         | no       | `10`       | Tunnel creation rate limit per token                   |
+| `HATCHWAY_MAX_REQUEST_BYTES`           | no       | `65536`    | Max request body size in bytes (`/v1/*`)               |
+| `HATCHWAY_API_READ_TIMEOUT`            | no       | `30s`      | API server read timeout                                |
+| `HATCHWAY_API_WRITE_TIMEOUT`           | no       | `30s`      | API server write timeout                               |
+| `HATCHWAY_LOG_USER_CONNS`              | no       | `false`    | Log individual user connections                        |
+| `HATCHWAY_FRPS_MODE`                   | no       | `external` | frps mode: `external` or `subprocess`                  |
+| `HATCHWAY_FRPS_BIN_PATH`               | no       | `frps`     | Path to frps binary (subprocess mode)                  |
+| `HATCHWAY_FRPS_CONFIG_PATH`            | if `HATCHWAY_FRPS_MODE=subprocess` | — | Path to frps config file (subprocess mode) |
+| `HATCHWAY_EVENTS_RETENTION_DAYS`       | no       | `30`       | Tunnel events retention in days                        |
+| `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` | no       | `24`       | Idempotency key retention in hours                     |
+| `HATCHWAY_PLUGIN_TIMEOUT`              | no       | `2s`       | Per-call deadline for frps plugin handlers             |
+
+### Docker Compose / Caddy only
+
+These are consumed by `docker-compose.yml`'s own shell interpolation and by
+the bundled Caddy reverse proxy — not read by the `hatchway` binary itself.
+If you run the bare binary outside Compose, set `HATCHWAY_FRPS_DOMAIN` and
+`HATCHWAY_TUNNEL_DOMAIN` (above) directly instead.
+
+| Variable              | Required      | Default                 | Description                                        |
+| ---------------------- | -------------- | ------------------------ | --------------------------------------------------- |
+| `HATCHWAY_DOMAIN`      | yes (Compose)  | —                        | Top-level domain; other domain vars derive from it   |
+| `HATCHWAY_API_DOMAIN`  | no             | `api.$HATCHWAY_DOMAIN`   | Public hostname Caddy proxies to the API server      |

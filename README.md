@@ -159,7 +159,7 @@ frpc ──TCP:7000──► frps:7000
 
 ## Build from source
 
-Requires Go 1.22+.
+Requires Go 1.26+.
 
 ```bash
 make build    # builds dist/hatchway

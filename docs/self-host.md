@@ -8,7 +8,7 @@ A guide to running Hatchway on your own infrastructure.
 - Docker and Docker Compose installed
 - A domain name you control (e.g. `example.com`)
 - A Cloudflare API token with Zone > DNS > Edit permission (for wildcard TLS via DNS-01 challenge)
-- Go 1.22+ (only needed for building from source)
+- Go 1.26+ (only needed for building from source)
 
 ## VPS preparation
 
@@ -280,27 +280,27 @@ You should see your local HTTP server's response.
 
 ```bash
 docker compose run --rm hatchway-server \
-  hatchway server user create --email alice@example.com --name Alice
+  server user create --email alice@example.com --name Alice
 ```
 
 ### Create an API token for a user
 
 ```bash
 docker compose run --rm hatchway-server \
-  hatchway server token create --user alice@example.com --name "laptop"
+  server token create --user alice@example.com --name "laptop"
 ```
 
 ### List users
 
 ```bash
-docker compose run --rm hatchway-server hatchway server user list
+docker compose run --rm hatchway-server server user list
 ```
 
 ### Revoke a token
 
 ```bash
 docker compose run --rm hatchway-server \
-  hatchway server token revoke <token-id>
+  server token revoke <token-id>
 ```
 
 ### Admin revoke a tunnel
@@ -316,7 +316,7 @@ Bootstrap admins are created by `hatchway server init`; create additional admins
 
 ```bash
 docker compose run --rm hatchway-server \
-  hatchway server user create --email ops@example.com --name Ops --admin
+  server user create --email ops@example.com --name Ops --admin
 ```
 
 Then:

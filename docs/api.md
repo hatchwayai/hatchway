@@ -51,7 +51,6 @@ Error codes:
 | `RATE_LIMITED`             | 429         | Too many requests                             |
 | `QUOTA_EXCEEDED`           | 403         | Concurrent tunnel limit reached               |
 | `INVALID_REQUEST`          | 400         | Malformed request body or parameters          |
-| `LOCAL_PORT_NOT_REACHABLE` | 400         | The specified local port is not listening     |
 | `INTERNAL`                 | 500         | Unexpected server error                       |
 
 ## Health endpoints (unauthenticated)
@@ -96,7 +95,7 @@ Create a new tunnel.
 | Field         | Type    | Required | Default       | Description                                            |
 | ------------- | ------- | -------- | ------------- | ------------------------------------------------------ |
 | `type`        | string  | yes      | —             | Tunnel type. Only `"http"` in MVP.                     |
-| `local_host`  | string  | no       | `"127.0.0.1"` | Local host to forward to. Must be `127.0.0.1`.         |
+| `local_host`  | string  | no       | `"127.0.0.1"` | Local host to forward to. Must be `127.0.0.1` or `localhost`. |
 | `local_port`  | integer | yes      | —             | Local port (1–65535).                                  |
 | `ttl_seconds` | integer | no       | `3600` (1h)   | Time-to-live in seconds. Capped by `HATCHWAY_MAX_TTL`. |
 
@@ -176,6 +175,8 @@ Get details for a specific tunnel. Returns `404` if the tunnel does not exist or
 ### `DELETE /v1/tunnels/{id}`
 
 Delete (revoke) a tunnel. Revokes the runtime token and disconnects the frpc client.
+Idempotent: deleting a tunnel that's already `expired` or `revoked` also returns
+`204` rather than an error, so retries after a network blip don't fail.
 
 **Response** `204 No Content` (empty body).
 
@@ -187,11 +188,11 @@ Admin-only endpoint to forcefully revoke any tunnel, regardless of ownership.
 The caller's API token must belong to a user with `is_admin = true`. Non-admin
 callers receive `403 FORBIDDEN`.
 
-**Response** `204 No Content` (empty body).
+**Response** `204 No Content` (empty body). Idempotent: revoking a tunnel
+that's already `expired` or `revoked` also returns `204` rather than an error.
 
 Returns `403 FORBIDDEN` if the caller is not an admin. Returns `404` if the
-tunnel does not exist. Returns `400` if the tunnel is already in a terminal
-state (`expired` or `revoked`).
+tunnel does not exist.
 
 ## Tunnel lifecycle
 

@@ -1,6 +1,6 @@
 # Hatchway: CLI-first Self-hosted Public Tunnel System
 
-**Status:** Implemented (v0.1.0). This document reflects the actual implementation. `PLAN.md` tracks progress phase by phase. When resuming work: read `PLAN.md` first to find the lowest unchecked task, then consult this file for the detailed spec.
+**Status:** Implemented, pending the `v0.1.0` tag. This document reflects the actual implementation. `PLAN.md` tracks progress phase by phase. When resuming work: read `PLAN.md` first to find the lowest unchecked task, then consult this file for the detailed spec.
 
 Hatchway is a CLI-first, self-hosted public tunnel system for exposing private/local services to the public internet through temporary or persistent public endpoints.
 
@@ -799,7 +799,7 @@ hatchway server user create --email alice@example.com --name alice
 hatchway server user list
 hatchway server token create --user alice --name dev-token
 hatchway server token revoke <token_id>
-hatchway server tunnels list
+hatchway server tunnels
 ```
 
 `hatchway server init` runs DB migrations, creates a single bootstrap admin user, and prints its first API token to stdout exactly once. The admin user owns the operator CLI's tokens; ordinary tunnel users are added with `hatchway server user create`. There is intentionally no self-signup endpoint in MVP — the operator decides who gets a token. `--user` on `token create` accepts either email or name.
@@ -849,16 +849,12 @@ Example JSON output:
 }
 ```
 
-Errors should also be JSON when `--json` is enabled:
-
-```json
-{
-  "error": {
-    "code": "LOCAL_PORT_NOT_REACHABLE",
-    "message": "No service is listening on 127.0.0.1:3000"
-  }
-}
-```
+**Implementation note:** CLI-side errors (bad flags, unreachable local port,
+network failures) are not currently JSON-formatted — they're printed as plain
+text to stderr with exit code 1 regardless of `--json`. Only the success-path
+output respects `--json`. Structured JSON errors for the CLI's own failures
+(as opposed to server-side API errors, which already return the JSON shape
+documented in `docs/api.md`) are a post-MVP improvement.
 
 ## PostgreSQL Data Model
 
@@ -913,23 +909,31 @@ CREATE TABLE tunnel_runtime_tokens (
 CREATE TABLE tunnel_events (
   id BIGSERIAL PRIMARY KEY,
   tunnel_id TEXT NOT NULL,
-  user_id UUID,
   event_type TEXT NOT NULL,
-  remote_addr TEXT,
   payload JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- response_status/response_body are nullable: a row is inserted as an
+-- in-flight reservation before the handler finishes, and completed_at
+-- distinguishes reserved-but-running from finished (migration 0004).
 CREATE TABLE idempotency_keys (
   token_id UUID NOT NULL REFERENCES api_tokens(id),
   key TEXT NOT NULL,
   request_hash TEXT NOT NULL,
-  response_status INTEGER NOT NULL,
-  response_body JSONB NOT NULL,
+  response_status INTEGER,
+  response_body BYTEA,
+  completed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (token_id, key)
 );
 ```
+
+`tunnel_events.user_id`/`remote_addr` and `idempotency_keys.response_body`'s
+original `JSONB` type were dropped/changed by later migrations (`0003`,
+`0004`) — event metadata lives in `payload` JSONB instead, and response
+bodies are stored as raw bytes (`BYTEA`) since the handler output isn't
+guaranteed to be canonical JSON text.
 
 Tokens should not be stored in plaintext.
 
@@ -1148,7 +1152,7 @@ MVP may postpone:
 
 Preferred language:
 
-- Go 1.22+
+- Go 1.26+
 
 Reasons:
 
