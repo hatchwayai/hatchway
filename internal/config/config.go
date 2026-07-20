@@ -15,8 +15,6 @@ type Config struct {
 	APIReadTimeout            time.Duration
 	APIWriteTimeout           time.Duration
 	MaxRequestBytes           int64
-	Domain                    string
-	APIDomain                 string
 	FRPSDomain                string
 	TunnelDomain              string
 	PluginSecret              string // frps→server plugin auth header (never returned to API users)
@@ -41,8 +39,6 @@ func Load() *Config {
 		APIReadTimeout:            envDuration("HATCHWAY_API_READ_TIMEOUT", 30*time.Second),
 		APIWriteTimeout:           envDuration("HATCHWAY_API_WRITE_TIMEOUT", 30*time.Second),
 		MaxRequestBytes:           int64(envInt("HATCHWAY_MAX_REQUEST_BYTES", 64*1024)),
-		Domain:                    envString("HATCHWAY_DOMAIN", ""),
-		APIDomain:                 envString("HATCHWAY_API_DOMAIN", ""),
 		FRPSDomain:                envString("HATCHWAY_FRPS_DOMAIN", ""),
 		TunnelDomain:              envString("HATCHWAY_TUNNEL_DOMAIN", "tunnel.example.com"),
 		PluginSecret:              envString("HATCHWAY_PLUGIN_SECRET", ""),
@@ -77,6 +73,9 @@ func (c *Config) Validate() error {
 	if c.TunnelDomain == "" {
 		missing = append(missing, "HATCHWAY_TUNNEL_DOMAIN")
 	}
+	if c.FRPSDomain == "" {
+		missing = append(missing, "HATCHWAY_FRPS_DOMAIN")
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
 	}
@@ -100,6 +99,12 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxRequestBytes <= 0 {
 		return fmt.Errorf("HATCHWAY_MAX_REQUEST_BYTES must be > 0, got %d", c.MaxRequestBytes)
+	}
+	if c.EventsRetentionDays <= 0 {
+		return fmt.Errorf("HATCHWAY_EVENTS_RETENTION_DAYS must be > 0, got %d", c.EventsRetentionDays)
+	}
+	if c.IdempotencyRetentionHours <= 0 {
+		return fmt.Errorf("HATCHWAY_IDEMPOTENCY_RETENTION_HOURS must be > 0, got %d", c.IdempotencyRetentionHours)
 	}
 	return nil
 }

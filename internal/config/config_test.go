@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -167,16 +168,19 @@ func TestEnvInt(t *testing.T) {
 
 func baseValidConfig() *Config {
 	return &Config{
-		DatabaseURL:      "postgres://localhost/x",
-		PluginSecret:     "p",
-		FRPSAuthToken:    "a",
-		TunnelDomain:     "tunnel.example.com",
-		PluginTimeout:    2 * time.Second,
-		MaxConcurrent:    5,
-		MaxTTL:           time.Hour,
-		RateCreatePerMin: 10,
-		MaxRequestBytes:  1024,
-		FRPSMode:         "external",
+		DatabaseURL:               "postgres://localhost/x",
+		PluginSecret:              "p",
+		FRPSAuthToken:             "a",
+		TunnelDomain:              "tunnel.example.com",
+		FRPSDomain:                "frps.example.com",
+		PluginTimeout:             2 * time.Second,
+		MaxConcurrent:             5,
+		MaxTTL:                    time.Hour,
+		RateCreatePerMin:          10,
+		MaxRequestBytes:           1024,
+		FRPSMode:                  "external",
+		EventsRetentionDays:       30,
+		IdempotencyRetentionHours: 24,
 	}
 }
 
@@ -196,6 +200,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"missing PLUGIN_SECRET", func(c *Config) { c.PluginSecret = "" }, "HATCHWAY_PLUGIN_SECRET"},
 		{"missing FRPS_AUTH_TOKEN", func(c *Config) { c.FRPSAuthToken = "" }, "HATCHWAY_FRPS_AUTH_TOKEN"},
 		{"missing TUNNEL_DOMAIN", func(c *Config) { c.TunnelDomain = "" }, "HATCHWAY_TUNNEL_DOMAIN"},
+		{"missing FRPS_DOMAIN", func(c *Config) { c.FRPSDomain = "" }, "HATCHWAY_FRPS_DOMAIN"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -205,7 +210,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error mentioning %s", tt.want)
 			}
-			if !contains(err.Error(), tt.want) {
+			if !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("error %q should mention %q", err.Error(), tt.want)
 			}
 		})
@@ -224,6 +229,9 @@ func TestValidate_NumericBounds(t *testing.T) {
 		{"zero RateCreatePerMin", func(c *Config) { c.RateCreatePerMin = 0 }, "RATE_CREATE_PER_MIN"},
 		{"zero MaxRequestBytes", func(c *Config) { c.MaxRequestBytes = 0 }, "MAX_REQUEST_BYTES"},
 		{"bad FRPSMode", func(c *Config) { c.FRPSMode = "weird" }, "FRPS_MODE"},
+		{"zero EventsRetentionDays", func(c *Config) { c.EventsRetentionDays = 0 }, "EVENTS_RETENTION_DAYS"},
+		{"negative EventsRetentionDays", func(c *Config) { c.EventsRetentionDays = -1 }, "EVENTS_RETENTION_DAYS"},
+		{"zero IdempotencyRetentionHours", func(c *Config) { c.IdempotencyRetentionHours = 0 }, "IDEMPOTENCY_RETENTION_HOURS"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -233,7 +241,7 @@ func TestValidate_NumericBounds(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error mentioning %s", tt.want)
 			}
-			if !contains(err.Error(), tt.want) {
+			if !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("error %q should mention %q", err.Error(), tt.want)
 			}
 		})
@@ -250,13 +258,4 @@ func TestValidate_SubprocessRequiresConfigPath(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("subprocess with config path should pass: %v", err)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
