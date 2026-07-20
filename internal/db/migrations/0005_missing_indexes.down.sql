@@ -1,0 +1,2 @@
+DROP INDEX idx_idempotency_keys_created_at;
+DROP INDEX idx_tunnel_runtime_tokens_token_prefix;
