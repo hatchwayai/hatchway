@@ -2,6 +2,7 @@ package frp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"testing"
@@ -72,6 +73,23 @@ func TestProcessWait(t *testing.T) {
 	_ = p.Wait()
 	if p.Running() {
 		t.Error("should not be running after Wait")
+	}
+}
+
+func TestProcessWait_ReturnsExitError(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+
+	p := NewProcess("test", "sh", []string{"-c", "exit 3"})
+	ctx := context.Background()
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := p.Wait(); err == nil {
+		t.Error("Wait should return the subprocess's exit error for a nonzero exit, got nil")
 	}
 }
 
@@ -153,6 +171,31 @@ func TestRestartWithBackoff(t *testing.T) {
 		t.Error("should be running after restart")
 	}
 	_ = p.Stop(2 * time.Second)
+}
+
+func TestRestartWithBackoff_ContextCancelledDuringBackoff(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not available")
+	}
+
+	p := NewProcess("test", "sleep", []string{"0.1"})
+	startCtx := context.Background()
+
+	if err := p.Start(startCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_ = p.Wait()
+
+	restartCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := p.RestartWithBackoff(restartCtx, time.Minute)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("RestartWithBackoff with a cancelled ctx = %v, want context.Canceled", err)
+	}
+	if p.Running() {
+		t.Error("should not have restarted when ctx was already cancelled")
+	}
 }
 
 func TestMain(m *testing.M) {

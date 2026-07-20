@@ -20,6 +20,7 @@ type Process struct {
 	cmd     *exec.Cmd
 	running bool
 	done    chan struct{}
+	waitErr error
 }
 
 // NewProcess creates a new subprocess manager.
@@ -58,6 +59,7 @@ func (p *Process) Start(ctx context.Context) error {
 		err := cmd.Wait()
 		p.mu.Lock()
 		p.running = false
+		p.waitErr = err
 		p.mu.Unlock()
 
 		if err != nil {
@@ -72,10 +74,11 @@ func (p *Process) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop sends SIGTERM to the subprocess and waits up to timeout for it to exit.
-// Sends SIGKILL if it doesn't exit in time. Safe to call concurrently with
-// Start: the *os.Process is captured under the lock, so we never race with
-// a fresh Start replacing p.cmd while we're signaling.
+// Stop sends an interrupt signal (SIGINT on Unix) to the subprocess and waits
+// up to timeout for it to exit. Sends SIGKILL if it doesn't exit in time.
+// Safe to call concurrently with Start: the *os.Process is captured under the
+// lock, so we never race with a fresh Start replacing p.cmd while we're
+// signaling.
 func (p *Process) Stop(timeout time.Duration) error {
 	p.mu.Lock()
 	if p.cmd == nil || !p.running {
@@ -111,8 +114,7 @@ func (p *Process) Wait() error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// running was set to false in the goroutine
-	return nil
+	return p.waitErr
 }
 
 // Running returns whether the subprocess is currently running.
