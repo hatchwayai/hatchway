@@ -11,14 +11,13 @@ import (
 type ErrorCode string
 
 const (
-	ErrUnauthenticated      ErrorCode = "UNAUTHENTICATED"
-	ErrForbidden            ErrorCode = "FORBIDDEN"
-	ErrNotFound             ErrorCode = "NOT_FOUND"
-	ErrRateLimited          ErrorCode = "RATE_LIMITED"
-	ErrQuotaExceeded        ErrorCode = "QUOTA_EXCEEDED"
-	ErrInvalidRequest       ErrorCode = "INVALID_REQUEST"
-	ErrLocalPortUnreachable ErrorCode = "LOCAL_PORT_NOT_REACHABLE"
-	ErrInternal             ErrorCode = "INTERNAL"
+	ErrUnauthenticated ErrorCode = "UNAUTHENTICATED"
+	ErrForbidden       ErrorCode = "FORBIDDEN"
+	ErrNotFound        ErrorCode = "NOT_FOUND"
+	ErrRateLimited     ErrorCode = "RATE_LIMITED"
+	ErrQuotaExceeded   ErrorCode = "QUOTA_EXCEEDED"
+	ErrInvalidRequest  ErrorCode = "INVALID_REQUEST"
+	ErrInternal        ErrorCode = "INTERNAL"
 )
 
 type ErrorResponse struct {

@@ -191,7 +191,7 @@ func TestIdempotencyMiddleware_WithTokenID_NilPool(t *testing.T) {
 	r.Header.Set("Idempotency-Key", "key-123")
 	r = r.WithContext(ContextWithAuth(r.Context(), "tok-1", "usr-1"))
 
-	// nil pool will panic in fetchCachedResponse — recover and verify
+	// nil pool will panic in handleIdempotentRequest — recover and verify
 	defer func() {
 		if r := recover(); r == nil {
 			// If no panic, the handler should have returned an error response
