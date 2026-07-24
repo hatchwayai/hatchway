@@ -4,15 +4,20 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 )
 
+// HealthzHandler returns a process-liveness handler.
 func HealthzHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}
 }
 
+// ReadyzHandler returns a readiness handler backed by the supplied check.
 func ReadyzHandler(pingFn func() error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := pingFn(); err != nil {
@@ -20,6 +25,7 @@ func ReadyzHandler(pingFn func() error) http.HandlerFunc {
 			WriteError(w, http.StatusServiceUnavailable, ErrInternal, "service not ready")
 			return
 		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}
@@ -37,10 +43,18 @@ func RequestLogMiddleware(next http.Handler) http.Handler {
 
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
+		requestID := middleware.GetReqID(ctx)
+		if requestID != "" {
+			w.Header().Set("X-Request-ID", requestID)
+		}
 
 		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
 
 		slog.Info("request",
+			"request_id", requestID,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
@@ -68,4 +82,10 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 		r.status = http.StatusOK
 	}
 	return r.ResponseWriter.Write(b)
+}
+
+// Unwrap lets net/http's ResponseController reach optional capabilities on the
+// underlying writer.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }

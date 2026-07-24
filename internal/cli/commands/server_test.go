@@ -68,3 +68,25 @@ func TestServerTunnelsCmd_HasJSONFlag(t *testing.T) {
 		t.Error("missing --json flag")
 	}
 }
+
+func TestZeroArgumentServerCommandsRejectStrayArguments(t *testing.T) {
+	user := serverUserCmd()
+	token := serverTokenCmd()
+	commands := []*cobra.Command{
+		serverInitCmd(),
+		serverRunCmd(),
+		findByName(user, "create"),
+		findByName(user, "list"),
+		findByName(token, "create"),
+		findByName(token, "list"),
+		serverTunnelsCmd(),
+	}
+	for _, cmd := range commands {
+		if cmd == nil {
+			t.Fatal("missing command under test")
+		}
+		if err := cmd.Args(cmd, []string{"unexpected"}); err == nil {
+			t.Errorf("%s should reject a positional argument", cmd.CommandPath())
+		}
+	}
+}

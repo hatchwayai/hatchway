@@ -1,17 +1,49 @@
 package config
 
 import (
-	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestLoadDefaults(t *testing.T) {
-	// Clear env vars to ensure defaults
-	os.Clearenv()
+var configEnvKeys = []string{
+	"DATABASE_URL",
+	"HATCHWAY_API_ADDR",
+	"HATCHWAY_FRPS_PLUGIN_ADDR",
+	"HATCHWAY_API_READ_TIMEOUT",
+	"HATCHWAY_API_WRITE_TIMEOUT",
+	"HATCHWAY_MAX_REQUEST_BYTES",
+	"HATCHWAY_FRPS_DOMAIN",
+	"HATCHWAY_TUNNEL_DOMAIN",
+	"HATCHWAY_PLUGIN_SECRET",
+	"HATCHWAY_FRPS_AUTH_TOKEN",
+	"HATCHWAY_PLUGIN_TIMEOUT",
+	"HATCHWAY_MAX_CONCURRENT_TUNNELS",
+	"HATCHWAY_MAX_TTL",
+	"HATCHWAY_RATE_CREATE_PER_MIN",
+	"HATCHWAY_LOG_USER_CONNS",
+	"HATCHWAY_FRPS_MODE",
+	"HATCHWAY_FRPS_BIN_PATH",
+	"HATCHWAY_FRPS_CONFIG_PATH",
+	"HATCHWAY_EVENTS_RETENTION_DAYS",
+	"HATCHWAY_IDEMPOTENCY_RETENTION_HOURS",
+	"HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS",
+}
 
-	cfg := Load()
+func clearConfigEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range configEnvKeys {
+		t.Setenv(key, "")
+	}
+}
+
+func TestLoadDefaults(t *testing.T) {
+	clearConfigEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
 	if cfg.APIAddr != ":9000" {
 		t.Errorf("default APIAddr = %q, want :9000", cfg.APIAddr)
 	}
@@ -48,20 +80,23 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadFromEnv(t *testing.T) {
-	os.Clearenv()
-	os.Setenv("DATABASE_URL", "postgres://localhost/test")
-	os.Setenv("HATCHWAY_API_ADDR", ":8080")
-	os.Setenv("HATCHWAY_FRPS_PLUGIN_ADDR", ":9090")
-	os.Setenv("HATCHWAY_PLUGIN_SECRET", "my-secret")
-	os.Setenv("HATCHWAY_TUNNEL_DOMAIN", "t.example.com")
-	os.Setenv("HATCHWAY_MAX_CONCURRENT_TUNNELS", "10")
-	os.Setenv("HATCHWAY_MAX_TTL", "2h")
-	os.Setenv("HATCHWAY_RATE_CREATE_PER_MIN", "20")
-	os.Setenv("HATCHWAY_LOG_USER_CONNS", "true")
-	os.Setenv("HATCHWAY_API_READ_TIMEOUT", "10s")
-	os.Setenv("HATCHWAY_API_WRITE_TIMEOUT", "15s")
+	clearConfigEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://localhost/test")
+	t.Setenv("HATCHWAY_API_ADDR", ":8080")
+	t.Setenv("HATCHWAY_FRPS_PLUGIN_ADDR", ":9090")
+	t.Setenv("HATCHWAY_PLUGIN_SECRET", "my-secret")
+	t.Setenv("HATCHWAY_TUNNEL_DOMAIN", "t.example.com")
+	t.Setenv("HATCHWAY_MAX_CONCURRENT_TUNNELS", "10")
+	t.Setenv("HATCHWAY_MAX_TTL", "2h")
+	t.Setenv("HATCHWAY_RATE_CREATE_PER_MIN", "20")
+	t.Setenv("HATCHWAY_LOG_USER_CONNS", "true")
+	t.Setenv("HATCHWAY_API_READ_TIMEOUT", "10s")
+	t.Setenv("HATCHWAY_API_WRITE_TIMEOUT", "15s")
 
-	cfg := Load()
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
 	if cfg.DatabaseURL != "postgres://localhost/test" {
 		t.Errorf("DatabaseURL = %q", cfg.DatabaseURL)
 	}
@@ -97,15 +132,32 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 }
 
-func TestLoadInvalidValuesFallBack(t *testing.T) {
-	os.Clearenv()
-	os.Setenv("HATCHWAY_MAX_CONCURRENT_TUNNELS", "not-a-number")
-	os.Setenv("HATCHWAY_MAX_TTL", "not-a-duration")
-	os.Setenv("HATCHWAY_RATE_CREATE_PER_MIN", "abc")
-	os.Setenv("HATCHWAY_LOG_USER_CONNS", "notbool")
-	os.Setenv("HATCHWAY_API_READ_TIMEOUT", "bad")
+func TestLoadInvalidValuesReturnError(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HATCHWAY_MAX_CONCURRENT_TUNNELS", "not-a-number")
+	t.Setenv("HATCHWAY_MAX_TTL", "not-a-duration")
+	t.Setenv("HATCHWAY_RATE_CREATE_PER_MIN", "abc")
+	t.Setenv("HATCHWAY_LOG_USER_CONNS", "notbool")
+	t.Setenv("HATCHWAY_API_READ_TIMEOUT", "bad")
 
-	cfg := Load()
+	cfg, err := Load()
+	if err == nil {
+		t.Fatal("Load() should reject invalid typed values")
+	}
+	for _, key := range []string{
+		"HATCHWAY_MAX_CONCURRENT_TUNNELS",
+		"HATCHWAY_MAX_TTL",
+		"HATCHWAY_RATE_CREATE_PER_MIN",
+		"HATCHWAY_LOG_USER_CONNS",
+		"HATCHWAY_API_READ_TIMEOUT",
+	} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("Load() error %q does not mention %s", err, key)
+		}
+	}
+
+	// Defaults are still populated so diagnostics and tests can inspect the
+	// complete candidate config, but callers must not ignore the error.
 	if cfg.MaxConcurrent != 5 {
 		t.Errorf("invalid int should fall back to default, got %d", cfg.MaxConcurrent)
 	}
@@ -137,11 +189,11 @@ func TestEnvBool(t *testing.T) {
 		{"", false},
 	}
 	for _, tt := range tests {
-		os.Clearenv()
-		if tt.val != "" {
-			os.Setenv("TEST_BOOL", tt.val)
+		t.Setenv("TEST_BOOL", tt.val)
+		got, err := envBool("TEST_BOOL", false)
+		if err != nil {
+			t.Fatalf("envBool(%q) error = %v", tt.val, err)
 		}
-		got := envBool("TEST_BOOL", false)
 		if got != tt.want {
 			t.Errorf("envBool(%q) = %v, want %v", tt.val, got, tt.want)
 		}
@@ -149,18 +201,22 @@ func TestEnvBool(t *testing.T) {
 }
 
 func TestEnvDuration(t *testing.T) {
-	os.Clearenv()
-	os.Setenv("TEST_DUR", "5m30s")
-	got := envDuration("TEST_DUR", time.Hour)
+	t.Setenv("TEST_DUR", "5m30s")
+	got, err := envDuration("TEST_DUR", time.Hour)
+	if err != nil {
+		t.Fatalf("envDuration() error = %v", err)
+	}
 	if got != 5*time.Minute+30*time.Second {
 		t.Errorf("got %v", got)
 	}
 }
 
 func TestEnvInt(t *testing.T) {
-	os.Clearenv()
-	os.Setenv("TEST_INT", "42")
-	got := envInt("TEST_INT", 0)
+	t.Setenv("TEST_INT", "42")
+	got, err := envInt("TEST_INT", 0)
+	if err != nil {
+		t.Fatalf("envInt() error = %v", err)
+	}
 	if got != 42 {
 		t.Errorf("got %d", got)
 	}
@@ -169,11 +225,13 @@ func TestEnvInt(t *testing.T) {
 func baseValidConfig() *Config {
 	return &Config{
 		DatabaseURL:               "postgres://localhost/x",
-		PluginSecret:              "p",
-		FRPSAuthToken:             "a",
+		PluginSecret:              "plugin_secret_0123456789abcdef01",
+		FRPSAuthToken:             "frps_auth_token_0123456789abcdef",
 		TunnelDomain:              "tunnel.example.com",
 		FRPSDomain:                "frps.example.com",
 		PluginTimeout:             2 * time.Second,
+		APIReadTimeout:            30 * time.Second,
+		APIWriteTimeout:           30 * time.Second,
 		MaxConcurrent:             5,
 		MaxTTL:                    time.Hour,
 		RateCreatePerMin:          10,
@@ -226,7 +284,10 @@ func TestValidate_NumericBounds(t *testing.T) {
 	}{
 		{"zero MaxConcurrent", func(c *Config) { c.MaxConcurrent = 0 }, "MAX_CONCURRENT"},
 		{"zero MaxTTL", func(c *Config) { c.MaxTTL = 0 }, "MAX_TTL"},
+		{"subsecond MaxTTL", func(c *Config) { c.MaxTTL = 500 * time.Millisecond }, "MAX_TTL"},
 		{"zero PluginTimeout", func(c *Config) { c.PluginTimeout = 0 }, "PLUGIN_TIMEOUT"},
+		{"zero APIReadTimeout", func(c *Config) { c.APIReadTimeout = 0 }, "API_READ_TIMEOUT"},
+		{"zero APIWriteTimeout", func(c *Config) { c.APIWriteTimeout = 0 }, "API_WRITE_TIMEOUT"},
 		{"zero RateCreatePerMin", func(c *Config) { c.RateCreatePerMin = 0 }, "RATE_CREATE_PER_MIN"},
 		{"zero MaxRequestBytes", func(c *Config) { c.MaxRequestBytes = 0 }, "MAX_REQUEST_BYTES"},
 		{"bad FRPSMode", func(c *Config) { c.FRPSMode = "weird" }, "FRPS_MODE"},
@@ -250,6 +311,57 @@ func TestValidate_NumericBounds(t *testing.T) {
 	}
 }
 
+func TestValidate_ServiceSecretsAndDomains(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"short plugin secret", func(c *Config) { c.PluginSecret = "short" }, "HATCHWAY_PLUGIN_SECRET"},
+		{"unsafe plugin secret", func(c *Config) { c.PluginSecret = strings.Repeat("a", 31) + "/" }, "HATCHWAY_PLUGIN_SECRET"},
+		{"short frps token", func(c *Config) { c.FRPSAuthToken = "short" }, "HATCHWAY_FRPS_AUTH_TOKEN"},
+		{"same secrets", func(c *Config) { c.FRPSAuthToken = c.PluginSecret }, "must be different"},
+		{"tunnel scheme", func(c *Config) { c.TunnelDomain = "https://tunnel.example.com" }, "HATCHWAY_TUNNEL_DOMAIN"},
+		{"tunnel wildcard", func(c *Config) { c.TunnelDomain = "*.tunnel.example.com" }, "HATCHWAY_TUNNEL_DOMAIN"},
+		{"frps port", func(c *Config) { c.FRPSDomain = "frps.example.com:7000" }, "HATCHWAY_FRPS_DOMAIN"},
+		{"trailing dot", func(c *Config) { c.TunnelDomain = "tunnel.example.com." }, "HATCHWAY_TUNNEL_DOMAIN"},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tt.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want mention of %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidate_TunnelDomainGeneratedHostBoundary(t *testing.T) {
+	maxRoot := strings.Join([]string{
+		strings.Repeat("a", 63),
+		strings.Repeat("b", 63),
+		strings.Repeat("c", 63),
+		strings.Repeat("d", 42),
+	}, ".")
+	if len(maxRoot) != maxTunnelDomainLength {
+		t.Fatalf("test root length = %d, want %d", len(maxRoot), maxTunnelDomainLength)
+	}
+
+	cfg := baseValidConfig()
+	cfg.TunnelDomain = maxRoot
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("maximum tunnel domain should validate: %v", err)
+	}
+
+	cfg.TunnelDomain += "e"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "at most 234 bytes") {
+		t.Fatalf("oversized tunnel domain error = %v", err)
+	}
+}
+
 func TestValidate_SubprocessRequiresConfigPath(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.FRPSMode = "subprocess"
@@ -257,7 +369,8 @@ func TestValidate_SubprocessRequiresConfigPath(t *testing.T) {
 		t.Fatal("subprocess without config path should fail")
 	}
 	cfg.FRPSConfigPath = "/etc/frp/frps.toml"
+	cfg.FRPSBinPath = "/usr/local/bin/frps"
 	if err := cfg.Validate(); err != nil {
-		t.Errorf("subprocess with config path should pass: %v", err)
+		t.Errorf("subprocess with binary and config paths should pass: %v", err)
 	}
 }

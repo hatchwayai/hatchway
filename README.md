@@ -1,74 +1,103 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zydo/hatchway/main/docs/assets/hatchway_logo.svg" alt="Hatchway" width="480">
+  <img
+    src="https://raw.githubusercontent.com/zydo/hatchway/main/docs/assets/hatchway_logo.svg"
+    alt="Hatchway"
+    width="480"
+  >
 </p>
 
 [![CI](https://github.com/zydo/hatchway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zydo/hatchway/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/github/go-mod/go-version/zydo/hatchway)](go.mod)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-CLI-first, self-hosted public tunnel system powered by [frp](https://github.com/fatedier/frp).
+CLI-first, self-hosted public HTTP tunnels powered by [frp](https://github.com/fatedier/frp).
 
-Hatchway is designed for agent-native workflows: temporary public endpoints, scoped runtime credentials, automatic expiration, and zero-dashboard automation.
+Hatchway is built for short-lived, scriptable workflows: expose a local HTTP
+service, get a URL on your own domain, and let the tunnel expire or revoke it
+when the work is done.
 
-Expose any local HTTP service to the internet with a single command:
-
-```
+```console
 $ hatchway http 3000
-
-Tunnel created: https://t-abc3x7km9w2p4rng.tunnel.example.com
+https://t-abc3x7km9w2p4rng.tunnel.example.com
 ```
 
 ## Who is this for?
 
-Use Hatchway if you want:
+Use Hatchway when you want:
 
-- An ngrok-like tunnel you fully control — on your own domain, your own server, no third-party service.
-- CLI-first ephemeral public URLs for dev tools, CI, webhooks, or AI agents.
-- Per-tunnel TTL, quotas, and token-scoped access — not just an open relay.
+- an ngrok-like HTTP tunnel on infrastructure and DNS you control;
+- a CLI suitable for local development, CI, webhooks, and agent workflows;
+- per-tunnel TTL and runtime credentials; and
+- per-user concurrent-tunnel quotas plus per-token creation rate limits.
 
-Don't use Hatchway if you need a full zero-trust access platform, web dashboard, or managed cloud service.
-
-## How it compares
-
-|                   | Hosted | Self-hosted | CLI-first | TTL / quota | Per-tunnel token |
-| ----------------- | ------ | ----------- | --------- | ----------- | ---------------- |
-| ngrok             | yes    | no          | yes       | limited     | limited          |
-| Cloudflare Tunnel | yes    | partial     | yes       | not core    | no               |
-| frp (raw)         | no     | yes         | no        | no          | no               |
-| zrok              | no     | yes         | yes       | yes         | limited          |
-| **Hatchway**      | no     | **yes**     | **yes**   | **yes**     | **yes**          |
-
-Hatchway is not a hosted service — you deploy it on your own VPS. It is not a general-purpose VPN or mesh network. It is a focused tunnel control plane: the CLI creates short-lived, token-scoped HTTP tunnels backed by frp as the data plane.
+Hatchway is intentionally narrower than a VPN, zero-trust access platform,
+managed tunnel service, or web dashboard. It adds a small control plane around
+frp: Hatchway owns users, credentials, tunnel reservations, lifecycle, and
+authorization; frp carries the traffic.
 
 ## Features
 
-- **CLI-first** — no web dashboard needed. `hatchway http 3000` and you're live.
-- **Self-hosted** — runs on your own infrastructure. No third-party tunnel service.
-- **Token-authenticated** — API tokens (`sk_live_...`) control access. Runtime tokens (`rt_...`) are scoped to individual tunnels.
-- **Subdomain-per-tunnel** — each tunnel gets `t-<id>.tunnel.example.com` with automatic HTTPS via Caddy.
-- **TTL + quotas** — tunnels auto-expire; per-user concurrent-tunnel and rate limits prevent abuse.
-- **Observability** — Prometheus metrics, structured JSON logging, health/ready endpoints.
+- **CLI-first** — `hatchway http 3000` creates and runs a tunnel without a dashboard.
+- **Self-hosted** — PostgreSQL, Hatchway, frps, and Caddy run on your infrastructure.
+- **Two credential scopes** — API tokens (`sk_live_...`) call the control API;
+  runtime tokens (`rt_...`) authorize one tunnel.
+- **Subdomain per tunnel** — URLs use
+  `t-<random-id>.tunnel.example.com`, with wildcard HTTPS terminated by Caddy.
+- **Bounded lifetime and usage** — TTL, a per-user non-terminal tunnel cap, and
+  a per-token creation rate limit are enforced server-side.
+- **Automation support** — selected CLI commands emit JSON, API creation is
+  idempotent, and the client retries safe or explicitly idempotent requests.
+- **Operations** — JSON request/application logs, Prometheus metrics, liveness,
+  readiness, retention sweepers, and automatic database migrations at startup.
+
+Only HTTP tunnels are implemented. The `tcp` and `udp` commands are visible as
+explicitly unsupported placeholders.
 
 ## Security model
 
-Hatchway uses a two-token architecture to separate control plane access from data plane auth:
+Hatchway separates control-plane access from data-plane registration:
 
-- **API tokens** (`sk_live_...`) — long-lived, used to create, list, and delete tunnels via the REST API. Stored hashed with argon2id; never stored plaintext.
-- **Runtime tokens** (`rt_...`) — short-lived, scoped to a single tunnel. Carried by frpc as metadata and validated by the server-side plugin on every `Login` and `NewProxy` callback. Expires with the tunnel.
+- **API tokens** (`sk_live_...`) are long-lived and revocable. Only their
+  prefix and a versioned SHA-256 digest are stored. The tokens contain enough
+  random entropy for digest-based verification; comparison is constant-time.
+  The verifier retains compatibility with legacy Argon2id rows so existing
+  installations can upgrade without rotating every token immediately, while
+  globally bounding concurrent legacy KDF work.
+- **Runtime tokens** (`rt_...`) are minted per tunnel, stored the same way, and
+  expire with that tunnel. frpc presents one as metadata; the internal frps
+  plugin validates it during `Login` and `NewProxy`.
+- **Request-time gating** in the bundled Caddy configuration checks tunnel
+  state and TTL against PostgreSQL before every HTTP request reaches frps.
+  Non-elapsed `active` and `closed` rows pass this check; reserved, expired,
+  revoked, and unknown tunnels fail closed. `closed` is advisory because frps
+  callbacks are asynchronous, and frps remains authoritative for whether a
+  route actually exists. Requests already admitted, including upgraded
+  connections, may drain naturally.
 
-Additional protections:
+Additional boundaries:
 
-- Tunnels auto-expire when their TTL elapses. Expired tunnels stop accepting traffic — the runtime token is rejected at the next frpc reconnect.
-- The frps plugin server (`:9001`) is **internal-only** — never exposed publicly, protected by a path-based secret on top of network isolation.
-- The frps bootstrap token (`HATCHWAY_FRPS_AUTH_TOKEN`) is returned to API users in the tunnel-create response so frpc can authenticate to frps. It keeps random scanners off frps but is **not** the security boundary for tunnel ownership — the per-tunnel runtime token is. If it leaks, an attacker can probe frps but cannot register a tunnel they don't own. The plugin secret (`HATCHWAY_PLUGIN_SECRET`) is never returned via the API.
-- Rate limits (default: 10 tunnel creates/min/token) and concurrent tunnel caps (default: 5/user) prevent abuse.
-- Tunnel IDs use 16 random characters from a Crockford alphabet (~79 bits of entropy), making enumeration infeasible.
+- The internal listener (`:9001`) serves the frps callback, Caddy request gate,
+  and metrics. Its callback/gate paths are protected by a shared path secret;
+  do not publish the listener.
+- `HATCHWAY_PLUGIN_SECRET` is shared only among Hatchway, frps, and Caddy. It
+  also derives the encryption key for successful idempotency-response bodies
+  cached in PostgreSQL.
+- `HATCHWAY_FRPS_AUTH_TOKEN` is a shared frps↔frpc bootstrap credential and is
+  returned in every tunnel-creation response. It deters unauthenticated
+  scanners, but it is not the ownership boundary; the per-tunnel runtime token
+  and plugin checks are.
+- The defaults allow 10 creates/minute per API token, 5 non-terminal tunnels
+  per user, and a maximum 24-hour TTL.
+- Tunnel IDs contain 16 characters from a 31-symbol, ambiguity-free
+  Crockford-style alphabet (about 79 random bits); the `t-` prefix makes them
+  valid DNS labels.
 
-> **Token format note:** `sk_live_` is a naming convention (secret key, live), not related to Stripe. `rt_` stands for runtime token. Tunnel IDs use the `t-` prefix to ensure DNS-label compliance.
+The `sk_live_` spelling is only a naming convention and is unrelated to
+Stripe. See [DESIGN.md](DESIGN.md) for the full trust model.
 
-## Quick start (Docker)
+## Quick start with Docker
 
-### 1. Clone and configure
+### 1. Configure
 
 ```bash
 git clone https://github.com/zydo/hatchway.git
@@ -76,111 +105,122 @@ cd hatchway
 cp .env.example .env
 ```
 
-Edit `.env` and set the five required variables:
+Set these values in `.env`:
 
-| Variable                   | Example                            | Purpose                                                                |
-| -------------------------- | ---------------------------------- | ---------------------------------------------------------------------- |
-| `HATCHWAY_DOMAIN`          | `example.com`                      | Your top-level domain                                                  |
-| `POSTGRES_PASSWORD`        | (random string)                    | PostgreSQL password                                                    |
-| `HATCHWAY_PLUGIN_SECRET`   | (output of `openssl rand -hex 32`) | frps→server plugin auth (server-internal, never returned to API users) |
-| `HATCHWAY_FRPS_AUTH_TOKEN` | (output of `openssl rand -hex 32`) | frps↔frpc bootstrap secret (returned to API users for frpc config)     |
-| `CLOUDFLARE_API_TOKEN`     | (Cloudflare API token)             | For Caddy DNS-01 wildcard certificate challenge                        |
+| Variable | Purpose |
+| --- | --- |
+| `HATCHWAY_DOMAIN` | Top-level domain, for example `example.com` |
+| `POSTGRES_PASSWORD` | PostgreSQL password |
+| `HATCHWAY_PLUGIN_SECRET` | Internal frps→Hatchway callback secret |
+| `HATCHWAY_FRPS_AUTH_TOKEN` | Shared frps↔frpc bootstrap credential |
+| `CLOUDFLARE_API_TOKEN` | Caddy DNS-01 credential; grant Zone Read and DNS Edit for the zone |
 
-### 2. DNS records
+Generate the two Hatchway secrets independently, for example with
+`openssl rand -hex 32`, then protect the completed file with
+`chmod 600 .env`.
 
-Create three A records pointing to your server's IP. If using Cloudflare:
+### 2. Configure DNS and the firewall
 
-| Record                 | Proxy mode     | Why                                                                                   |
-| ---------------------- | -------------- | ------------------------------------------------------------------------------------- |
-| `api.example.com`      | Orange cloud   | API endpoint, proxied via Cloudflare for DDoS protection                              |
-| `frps.example.com`     | **Grey cloud** | frpc connects on raw TCP port 7000, which Cloudflare cannot proxy                     |
-| `*.tunnel.example.com` | **Grey cloud** | Caddy serves the wildcard TLS cert directly; Cloudflare's Universal SSL is unreliable |
+Point these records at the server:
 
-If using Cloudflare, set **SSL/TLS mode to "Full (strict)"** — "Flexible" causes an infinite redirect loop.
+| Record | Cloudflare mode | Purpose |
+| --- | --- | --- |
+| `api.example.com` | proxied or DNS-only | Public control API |
+| `frps.example.com` | **DNS-only** | Raw frpc TCP connection on port 7000 |
+| `*.tunnel.example.com` | **DNS-only** | Wildcard HTTPS served by Caddy |
 
-### 3. Firewall
+When Cloudflare proxies the API record, use **Full (strict)** SSL mode.
+Open inbound TCP ports 80, 443, and 7000. Never expose 9001.
 
-Open ports 80, 443, and 7000 on your cloud provider's firewall. For example on GCP:
-
-```bash
-gcloud compute firewall-rules create allow-frps \
-  --project YOUR_PROJECT --allow tcp:7000 \
-  --direction INGRESS --source-ranges 0.0.0.0/0
-```
-
-### 4. Start the stack
+### 3. Start and bootstrap
 
 ```bash
 docker compose up -d
-```
-
-### 5. Bootstrap
-
-```bash
 docker compose run --rm hatchway-server server init
 ```
 
-This creates the database schema and prints your first admin API token. Save it.
+`server run` automatically applies embedded migrations before accepting
+traffic. `server init` is still required once to create the bootstrap admin
+and print its first API token. Save that token: plaintext tokens are shown
+only when created.
 
-> **Note:** Use `docker compose run --rm hatchway-server server init`, not `docker compose exec`. The container's ENTRYPOINT is already `hatchway`, so `exec` would require omitting the binary name.
+The image entrypoint is already `hatchway`; therefore the Compose command is
+`server init`, not `hatchway server init`.
 
-### 6. Create a tunnel
+### 4. Run a tunnel
 
-Install the client (see [docs/cli.md](docs/cli.md) for binary downloads):
+Build or install the client, and put an executable `frpc` either next to the
+`hatchway` binary or on `PATH`:
 
 ```bash
 hatchway auth set-token --server https://api.example.com sk_live_...
 hatchway http 3000
 ```
 
-Any request to `https://t-<id>.tunnel.example.com` now hits `localhost:3000`.
-
-Press Ctrl-C to tear down the tunnel.
+Requests to the printed URL now reach `127.0.0.1:3000`. Ctrl-C stops frpc and
+the CLI makes a bounded cleanup request that revokes the tunnel. The same
+cleanup runs after configuration failures, clean frpc exits, and exhausted
+restart attempts.
 
 ## Architecture
 
-```
-Client (curl/browser)
-  │
-  ├─ HTTPS ──► Cloudflare (orange cloud) ──► Caddy:443 ──► hatchway-server:9000
-  │             api.example.com                          (API endpoints)
-  │
-  └─ HTTPS ──► Caddy:443 ──► frps:8081 ──► frpc ──► localhost:8080
-               *.tunnel.example.com      (vhost proxy)   (your local service)
+```text
+API client ──HTTPS──► Caddy ─────────► hatchway-server:9000 ──► PostgreSQL
 
-frpc ──TCP:7000──► frps:7000
-                    (control channel, grey cloud DNS)
+Browser ──HTTPS──► Caddy ──auth──► hatchway-server:9001 ──► PostgreSQL
+                     │ allow
+                     ▼
+                  frps:8081 ──► frpc ──► 127.0.0.1:<port>
+                     ▲
+frpc ───────TCP:7000─┘
 ```
 
-- **API server** (`:9000`) — REST API for tunnel CRUD. Public behind Caddy.
-- **Plugin server** (`:9001`) — frps plugin endpoint for auth decisions. **Not exposed** — only reachable on the internal Docker network. Auth via path-based secret (`/frp/plugin/{secret}`).
-- **frps** (`:8081`) — receives tunnel traffic from the internet and proxies to frpc clients.
-- **Caddy** — terminates TLS, routes `api.*` to the API server and `*.tunnel.*` to frps. Uses DNS-01 challenge with Cloudflare for the wildcard certificate.
+- **Hatchway API (`:9000`)** — authenticated tunnel CRUD and `/v1/me`.
+- **Hatchway internal listener (`:9001`)** — frps registration callbacks,
+  Caddy request authorization, and metrics; it is not a public API.
+- **frps (`:7000`, `:8081`)** — frpc control channel and HTTP vhost data plane.
+- **Caddy (`:80`, `:443`)** — API and wildcard tunnel TLS/routing, with an
+  authorization subrequest before each wildcard request.
+- **PostgreSQL** — users, token digests, tunnel state, events, and encrypted
+  idempotency replay records.
 
 ## Build from source
 
-Requires Go 1.26+.
+Requires Go 1.26.5 or a compatible newer Go release.
 
 ```bash
-make build    # builds dist/hatchway
-make test     # runs all tests
-make lint     # runs golangci-lint
+make build
+make test
+make lint
 ```
 
-For release builds with bundled frpc, see [`.goreleaser.yml`](.goreleaser.yml).
+Integration tests start isolated PostgreSQL containers by default. To reuse a
+local database, set `HATCHWAY_TEST_DATABASE_URL`; its parsed database name must
+end in `_test`. These fixtures clear application tables and migration tests
+recreate the `public` schema, so they deliberately ignore the service's
+`DATABASE_URL`. Run shared-database tests serially with
+`go test -p 1 ./...`.
+
+`make build` writes `dist/hatchway`; provide `frpc` separately. The GoReleaser
+configuration is prepared to place `hatchway` and `frpc` side by side in
+client archives, but this repository currently has no published release tag.
 
 ## Documentation
 
-| Document                                             | Contents                                                         |
-| ---------------------------------------------------- | ---------------------------------------------------------------- |
-| [docs/self-host.md](docs/self-host.md)               | VPS setup, DNS, env vars, first-token bootstrap, troubleshooting |
-| [docs/api.md](docs/api.md)                           | REST API endpoint reference                                      |
-| [docs/cli.md](docs/cli.md)                           | CLI subcommand reference with examples                           |
-| [DESIGN.md](DESIGN.md)                               | Full system design and rationale                                 |
-| [docs/deployment-notes.md](docs/deployment-notes.md) | End-to-end deployment walkthrough and common issues              |
+| Document | Contents |
+| --- | --- |
+| [docs/self-host.md](docs/self-host.md) | Canonical operator setup and upgrade guide |
+| [docs/api.md](docs/api.md) | Implemented REST API contract |
+| [docs/cli.md](docs/cli.md) | Implemented client and server commands |
+| [DESIGN.md](DESIGN.md) | Current architecture, invariants, and future boundaries |
+| [PLAN.md](PLAN.md) | Historical roadmap and remaining release work |
+| [docs/source-reading-guide.md](docs/source-reading-guide.md) | Top-down code-reading path |
+| [docs/extending.md](docs/extending.md) | Supported integration surface and current gaps |
+| [docs/deployment-notes.md](docs/deployment-notes.md) | Concise deployment checklist |
 
 ## License
 
 Hatchway is [MIT licensed](LICENSE).
 
-This project uses [frp](https://github.com/fatedier/frp) (Apache 2.0) as standalone binaries. See [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES) for details.
+This project uses [frp](https://github.com/fatedier/frp) (Apache 2.0) as
+standalone binaries. See [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).

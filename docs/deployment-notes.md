@@ -1,185 +1,132 @@
-# Hatchway Deployment Notes
+# Deployment Notes
 
-## Prerequisites
+This is a concise field checklist. [self-host.md](self-host.md) is the
+canonical, detailed operator guide; [api.md](api.md) and [cli.md](cli.md)
+define behavior.
 
-- A domain with DNS managed by Cloudflare
-- A cloud VM (GCP, AWS, etc.) with a public IP
-- Docker and Docker Compose installed on the VM
-- Cloudflare API token with Zone > DNS > Edit permission
+## Before deployment
 
-## 1. DNS Setup (Cloudflare)
+- Point `api.<domain>`, `frps.<domain>`, and `*.tunnel.<domain>` at the host.
+- Keep the frps and wildcard records DNS-only when using Cloudflare. Raw TCP
+  port 7000 cannot use the normal Cloudflare HTTP proxy.
+- Use Cloudflare **Full (strict)** mode if the API record is proxied.
+- Give Caddy's Cloudflare token only **Zone Read** and **DNS Edit** for the
+  relevant zone.
+- Open TCP 80, 443, and 7000. Do not publish Hatchway's internal port 9001.
 
-Create three A records pointing to your VM's public IP:
+## Secrets and `.env`
 
-| Record          | Type | Name | Proxy          | Purpose                                   |
-| --------------- | ---- | ---- | -------------- | ----------------------------------------- |
-| api.domain      | A    | api  | Orange cloud   | API endpoint, proxied via Cloudflare      |
-| frps.domain     | A    | frps | **Grey cloud** | frpc TCP connections on port 7000         |
-| *.tunnel.domain | A    | *    | **Grey cloud** | Tunnel traffic, Caddy serves wildcard TLS |
-
-**Cloudflare SSL/TLS mode** must be set to **Full (strict)** in Dashboard > SSL/TLS.
-"Flexible" causes an infinite 308 redirect loop because Cloudflare connects HTTP to origin, Caddy redirects to HTTPS, loop.
-
-## 2. Cloud Provider Firewall
-
-Open these ports on the VM's cloud firewall:
-
-| Port | Protocol | Purpose                                   |
-| ---- | -------- | ----------------------------------------- |
-| 80   | TCP      | HTTP (Caddy redirects to HTTPS)           |
-| 443  | TCP      | HTTPS (API + tunnel traffic via Caddy)    |
-| 7000 | TCP      | frps control channel (frpc connects here) |
-
-GCP example:
-```bash
-gcloud compute firewall-rules create allow-frps \
-  --project YOUR_PROJECT \
-  --allow tcp:7000 \
-  --direction INGRESS \
-  --source-ranges 0.0.0.0/0
-```
-
-## 3. Environment Configuration
-
-Copy `.env.example` to `.env` and fill in:
+Start from `.env.example`. Generate values in a shell and paste the resulting
+strings into `.env`:
 
 ```bash
-# Required
-HATCHWAY_DOMAIN=yourdomain.com
-POSTGRES_PASSWORD=$(openssl rand -hex 24)
-HATCHWAY_PLUGIN_SECRET=$(openssl rand -hex 32)
-HATCHWAY_FRPS_AUTH_TOKEN=$(openssl rand -hex 32)
-CLOUDFLARE_API_TOKEN=your-cloudflare-api-token
-
-# Optional (defaults work)
-HATCHWAY_API_DOMAIN=api.yourdomain.com
-HATCHWAY_FRPS_DOMAIN=frps.yourdomain.com
-HATCHWAY_TUNNEL_DOMAIN=tunnel.yourdomain.com
+openssl rand -hex 24  # POSTGRES_PASSWORD
+openssl rand -hex 32  # HATCHWAY_PLUGIN_SECRET
+openssl rand -hex 32  # HATCHWAY_FRPS_AUTH_TOKEN
 ```
 
-## 4. Deploy
+Do not put `$(openssl ...)` in `.env`; Compose dotenv files do not execute
+shell command substitution.
+
+Run `chmod 600 .env` after filling it because the file contains database and
+service secrets.
+
+The two Hatchway secrets must be different:
+
+- `HATCHWAY_PLUGIN_SECRET` remains internal to frps, Caddy, and Hatchway. It
+  protects callback/request-gate paths and derives the encryption key for
+  idempotency cache bodies.
+- `HATCHWAY_FRPS_AUTH_TOKEN` is deliberately returned to tunnel creators as
+  `frp.server_token`. The per-tunnel runtime token is the ownership credential.
+
+Rotating the plugin secret requires updating frps, Caddy, and Hatchway
+together. It also makes idempotency bodies encrypted with the previous value
+unreadable; prefer to wait for the configured replay-retention window plus one
+hourly sweeper interval before rotation, or accept that affected clients must
+retry with new keys.
+
+## Deploy and bootstrap
 
 ```bash
 docker compose up -d --build
+docker compose ps
+docker compose run --rm hatchway-server \
+  server init --admin-email admin@example.com
 ```
 
-Wait for postgres to become healthy, then bootstrap:
+The container entrypoint is already `/hatchway`, so do not repeat the binary
+name. Save the one-time API token printed by `server init`.
+
+`server run` applies all embedded migrations automatically before opening
+listeners, including upgrades through migration `0006`. `server init` also
+applies migrations, but its distinct purpose is creating a bootstrap admin.
+It is not a migration-only command.
+
+`server init --force` adds another admin after confirmation; it does not reset
+the database or revoke existing tokens. Supply a unique email.
+
+## Verify
 
 ```bash
-docker compose run --rm hatchway-server server init
+curl -fsS https://api.example.com/healthz
+curl -fsS https://api.example.com/readyz
+curl -fsS \
+  -H "Authorization: Bearer sk_live_..." \
+  https://api.example.com/v1/me
 ```
 
-Save the admin token printed — it won't be shown again.
+`readyz` checks both database reachability and required schema tables. Unknown
+routes, invalid methods, and API failures use JSON error envelopes. Server
+request/application logs are JSON and carry request IDs.
 
-## 5. Verify
+## End-to-end test
+
+Install an executable frpc v0.69.0 next to `hatchway` or on `PATH`, then:
 
 ```bash
-# Health check (from any machine)
-curl https://api.yourdomain.com/healthz
+hatchway auth set-token \
+  --server https://api.example.com \
+  sk_live_...
 
-# Auth check
-curl -H "Authorization: Bearer YOUR_ADMIN_TOKEN" https://api.yourdomain.com/v1/me
+python3 -m http.server 3000
 ```
 
-## 6. End-to-End Tunnel Test
-
-### Create a tunnel
+In another terminal:
 
 ```bash
-curl -X POST https://api.yourdomain.com/v1/tunnels \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"type":"http","local_port":8080,"ttl_seconds":300}'
+hatchway http 3000 --ttl 15m
 ```
 
-Save the `runtime_token`, `tunnel_id`, and `server_token` from the response.
+The printed HTTPS URL should reach the local server. Ctrl-C stops frpc and
+revokes the tunnel. Caddy checks Hatchway before every wildcard HTTP request,
+so revocation and TTL expiry take effect even if frps still has a proxy
+registration; requests already admitted, including upgraded connections, may
+drain.
 
-### Configure frpc
-
-frpc requires a TOML config file (CLI flags cannot set client-level metadatas):
-
-```toml
-serverAddr = "frps.yourdomain.com"
-serverPort = 7000
-auth.method = "token"
-auth.token = "SERVER_TOKEN_FROM_API"
-metadatas.runtime_token = "RUNTIME_TOKEN_FROM_API"
-
-[[proxies]]
-name = "TUNNEL_ID"
-type = "http"
-localPort = 8080
-subdomain = "TUNNEL_ID"
-```
-
-Key points:
-- `auth.token` is `HATCHWAY_FRPS_AUTH_TOKEN` (returned as `server_token` in the API response)
-- `metadatas.runtime_token` is the runtime token from the API response (dotted key format, NOT `[metas]` section)
-- `name` and `subdomain` must both equal the tunnel ID
-
-### Start local service and frpc
+## Operator checks
 
 ```bash
-python3 -m http.server 8080 &
-./frpc -c frpc.toml
+docker compose run --rm hatchway-server server user list
+docker compose run --rm hatchway-server server token list
+docker compose run --rm hatchway-server server tunnels
+docker compose logs hatchway-server frps caddy
 ```
 
-frpc will print `login to server success` and `start proxy success`, then stay running.
+Use `server token list` to obtain a complete token ID before
+`server token revoke <token-id>`. The end-user `hatchway list` command returns
+all owned records, including expired and revoked tunnels.
 
-### Test
+Prometheus metrics are available only on the internal
+`http://hatchway-server:9001/metrics` endpoint. Scrape it from the Compose
+network; do not expose it through Caddy or a host port.
+
+## Upgrade
 
 ```bash
-curl https://TUNNEL_ID.tunnel.yourdomain.com
+git pull
+docker compose up -d --build
+curl -fsS https://api.example.com/readyz
 ```
 
-You should see your local HTTP server's response.
-
-## 7. Tunnel Management
-
-```bash
-# List tunnels
-curl https://api.yourdomain.com/v1/tunnels \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-
-# Get a specific tunnel
-curl https://api.yourdomain.com/v1/tunnels/TUNNEL_ID \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-
-# Delete a tunnel
-curl -X DELETE https://api.yourdomain.com/v1/tunnels/TUNNEL_ID \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-
-# Admin revoke (force-revoke even if active)
-curl -X POST https://api.yourdomain.com/v1/admin/tunnels/TUNNEL_ID/revoke \
-  -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
-```
-
-## Common Issues
-
-| Symptom                                                  | Cause                                                                      | Fix                                                                               |
-| -------------------------------------------------------- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| 308 redirect loop on API                                 | Cloudflare SSL mode is "Flexible"                                          | Set to "Full (strict)"                                                            |
-| frps crash-loop: `unknown field "headers"`               | frps doesn't support custom headers in httpPlugins config                  | Use path-based auth: `path = "/frp/plugin/${SECRET}"`                             |
-| hatchway-server crash-loop: `unknown command "hatchway"` | Dockerfile ENTRYPOINT is already `/hatchway`, command had extra `hatchway` | Use `command: ["server", "run"]` in docker-compose                                |
-| frpc: `i/o timeout` on port 7000                         | Cloud provider firewall blocks port 7000                                   | Add firewall rule for tcp:7000                                                    |
-| frpc: `missing runtime token`                            | `--metadatas` CLI flag sets proxy-level metas, not client-level            | Use TOML config file with `metadatas.runtime_token`                               |
-| frpc: `invalid credentials`                              | frps entrypoint not substituting `HATCHWAY_FRPS_AUTH_TOKEN`                | Ensure envsubst includes all needed vars in entrypoint                            |
-| SSL handshake failure on tunnel URL                      | Cloudflare Universal SSL wildcard not provisioned                          | Grey-cloud the `*.tunnel` DNS record; let Caddy serve Let's Encrypt wildcard cert |
-| `curl` returns empty on HTTP                             | Caddy auto-HTTPS redirects HTTP to HTTPS                                   | Use `https://` or `curl -L` to follow redirects                                   |
-| frps "Not Found" page                                    | frpc not running or tunnel expired                                         | Keep frpc running; recreate tunnel if TTL expired                                 |
-| Docker socket permission denied                          | User not in docker group                                                   | Use `sudo` or `sudo usermod -aG docker $USER`                                     |
-
-## Architecture Summary
-
-```
-Client (curl/browser)
-  │
-  ├─ HTTPS ──► Cloudflare (orange cloud) ──► Caddy:443 ──► hatchway-server:9000
-  │             api.yourdomain.com                          (API endpoints)
-  │
-  └─ HTTPS ──► Caddy:443 ──► frps:8081 ──► frpc ──► localhost:8080
-               *.tunnel.yourdomain.com      (vhost proxy)   (your local service)
-
-frpc ──TCP:7000──► frps:7000
-                    (control channel, grey cloud DNS)
-```
+Take a PostgreSQL backup before upgrading. Startup aborts if a migration
+fails, and readiness stays false if the expected schema is unavailable.

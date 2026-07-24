@@ -2,18 +2,15 @@ package tunnels
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/zydo/hatchway/internal/db"
+	"github.com/zydo/hatchway/internal/testutil"
 )
 
 // Internal-package integration tests exercising the unexported reaper and
@@ -26,25 +23,7 @@ func setupLifecyclePool(t *testing.T) (*pgxpool.Pool, string, string) {
 		t.Skip("skipping integration test")
 	}
 
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		ctx := context.Background()
-		c, err := postgres.Run(ctx,
-			"postgres:16",
-			postgres.WithDatabase("hatchway_test"),
-			postgres.WithUsername("hatchway"),
-			postgres.WithPassword("hatchway_test"),
-			testcontainers.WithWaitStrategy(
-				wait.ForListeningPort("5432/tcp"),
-				wait.ForLog("database system is ready to accept connections"),
-			),
-		)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = c.Terminate(ctx) })
-
-		connStr, err = c.ConnectionString(ctx, "sslmode=disable")
-		require.NoError(t, err)
-	}
+	connStr := testutil.DatabaseURL(t)
 
 	require.NoError(t, db.RunMigrations(connStr))
 
@@ -85,6 +64,14 @@ func TestTransition_StateMachineIntegration(t *testing.T) {
 		tunnelID, userID,
 	)
 	require.NoError(t, err)
+	runtimeTokenID := uuid.New().String()
+	_, err = pool.Exec(ctx,
+		`INSERT INTO tunnel_runtime_tokens
+		   (id, tunnel_id, token_prefix, token_hash, expires_at)
+		 VALUES ($1, $2, 'runtime-test', 'hash', now() + interval '1 hour')`,
+		runtimeTokenID, tunnelID,
+	)
+	require.NoError(t, err)
 
 	steps := []struct {
 		event Event
@@ -104,6 +91,14 @@ func TestTransition_StateMachineIntegration(t *testing.T) {
 		if got != s.want {
 			t.Fatalf("after %s, got %s want %s", s.event, got, s.want)
 		}
+	}
+
+	var runtimeTokenRevoked bool
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM tunnel_runtime_tokens WHERE id = $1", runtimeTokenID,
+	).Scan(&runtimeTokenRevoked))
+	if !runtimeTokenRevoked {
+		t.Error("EventRevoke should revoke live runtime credentials atomically")
 	}
 
 	if err := Transition(ctx, pool, tunnelID, EventNewProxy); err == nil {
@@ -138,6 +133,54 @@ func TestTransition_InvalidEventReturnsError(t *testing.T) {
 	// reserved → CloseProxy is not a defined transition.
 	if err := Transition(ctx, pool, tunnelID, EventCloseProxy); err == nil {
 		t.Error("invalid transition should error")
+	}
+}
+
+func TestTransition_ActiveNewProxyIsIdempotent(t *testing.T) {
+	pool, userID, _ := setupLifecyclePool(t)
+	ctx := context.Background()
+	tunnelID := "t-active-reconnect"
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tunnels
+		   (id, user_id, type, local_host, local_port, status, expires_at)
+		 VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'active', now() + interval '1 hour')`,
+		tunnelID, userID,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, Transition(ctx, pool, tunnelID, EventNewProxy))
+
+	var eventCount int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM tunnel_events WHERE tunnel_id = $1", tunnelID,
+	).Scan(&eventCount))
+	if eventCount != 0 {
+		t.Errorf("idempotent active reconnect emitted %d lifecycle events", eventCount)
+	}
+}
+
+func TestTransition_NewProxyRejectsElapsedTunnel(t *testing.T) {
+	pool, userID, _ := setupLifecyclePool(t)
+	ctx := context.Background()
+	tunnelID := "t-elapsednewproxy"
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tunnels
+		   (id, user_id, type, local_host, local_port, status, expires_at)
+		 VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() - interval '1 second')`,
+		tunnelID, userID,
+	)
+	require.NoError(t, err)
+
+	if err := Transition(ctx, pool, tunnelID, EventNewProxy); err == nil {
+		t.Fatal("NewProxy should reject an elapsed tunnel")
+	}
+
+	var status string
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT status FROM tunnels WHERE id = $1", tunnelID,
+	).Scan(&status))
+	if status != "reserved" {
+		t.Errorf("elapsed tunnel status = %q, want reserved until reaper runs", status)
 	}
 }
 
@@ -332,7 +375,7 @@ func TestSweepRuntimeTokens(t *testing.T) {
 	}
 }
 
-func TestCountActiveTunnels(t *testing.T) {
+func TestCountNonTerminalTunnels(t *testing.T) {
 	pool, userID, _ := setupLifecyclePool(t)
 	ctx := context.Background()
 
@@ -344,7 +387,7 @@ func TestCountActiveTunnels(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	n, err := CountActiveTunnels(ctx, pool, userID)
+	n, err := CountNonTerminalTunnels(ctx, pool, userID)
 	require.NoError(t, err)
 	if n != 3 {
 		t.Errorf("expected 3 active (reserved+active+closed), got %d", n)

@@ -1,207 +1,232 @@
 # Self-hosting Hatchway
 
-A guide to running Hatchway on your own infrastructure.
+This is the canonical guide for the bundled Docker Compose deployment:
+PostgreSQL, Hatchway, frps, and Caddy on one host.
 
 ## Prerequisites
 
-- A VPS or server with a public IP (minimum 1 GB RAM)
-- Docker and Docker Compose installed
-- A domain name you control (e.g. `example.com`)
-- A Cloudflare API token with Zone > DNS > Edit permission (for wildcard TLS via DNS-01 challenge)
-- Go 1.26+ (only needed for building from source)
+- A Linux host with a public IP
+- Docker Engine with the Compose plugin
+- A domain you control
+- Cloudflare DNS for the bundled Caddy image, or equivalent custom Caddy
+  configuration for another DNS provider
+- A Cloudflare API token scoped to the zone with **Zone Read** and **DNS Edit**
 
-## VPS preparation
+Go is needed only when building the client or server outside Docker.
 
-### 1. Install Docker
+## Network and DNS
 
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# Log out and back in for group changes to take effect
-```
+Open these inbound TCP ports:
 
-### 2. Open firewall ports
+| Port | Consumer | Purpose |
+| --- | --- | --- |
+| 80 | Caddy | ACME/HTTP redirect |
+| 443 | Caddy | Public API and tunnel HTTPS |
+| 7000 | frps | frpc control/data connection |
 
-| Port | Protocol | Purpose                                 |
-| ---- | -------- | --------------------------------------- |
-| 80   | TCP      | HTTP (Caddy — redirects to HTTPS)       |
-| 443  | TCP      | HTTPS (Caddy — API + tunnel traffic)    |
-| 7000 | TCP      | frps control channel (frpc connections) |
+Do not expose 9000 directly when Caddy is the public API entrypoint. Never
+expose port 9001: it contains the frps callback, Caddy request-authorization
+endpoint, and Prometheus metrics, all intended only for the private Compose
+network. frps's HTTP vhost port 8081 is also private and reached through
+Caddy.
 
-> **Note:** Port 9001 (plugin endpoint) should **not** be exposed publicly. It is only used on the internal Docker network.
+Create three A/AAAA records:
 
-Example for GCP:
+| Record | Destination | Cloudflare mode |
+| --- | --- | --- |
+| `api.example.com` | server | Proxied or DNS-only |
+| `frps.example.com` | server | **DNS-only** |
+| `*.tunnel.example.com` | server | **DNS-only** |
 
-```bash
-gcloud compute firewall-rules create allow-frps \
-  --project YOUR_PROJECT \
-  --allow tcp:7000 \
-  --direction INGRESS \
-  --source-ranges 0.0.0.0/0
-```
+The normal Cloudflare proxy cannot carry arbitrary raw TCP on port 7000.
+Caddy obtains and serves the wildcard tunnel certificate, so keep the wildcard
+record DNS-only as well. If the API record is proxied, select Cloudflare
+**Full (strict)** SSL/TLS mode; “Flexible” creates an HTTP→HTTPS redirect loop.
 
-### 3. Clone the repo
+## Configure
 
 ```bash
 git clone https://github.com/zydo/hatchway.git
 cd hatchway
-```
-
-## DNS records
-
-Create the following A records with your DNS provider:
-
-| Record                 | Type | Value              |
-| ---------------------- | ---- | ------------------ |
-| `api.example.com`      | A    | `<your-server-ip>` |
-| `frps.example.com`     | A    | `<your-server-ip>` |
-| `*.tunnel.example.com` | A    | `<your-server-ip>` |
-
-### Cloudflare-specific setup
-
-If using Cloudflare for DNS:
-
-- **`api.example.com`** — can use **orange cloud** (proxied). Cloudflare handles DDoS protection and client-facing TLS.
-- **`frps.example.com`** — must use **grey cloud** (DNS only). frpc connects on raw TCP port 7000, which Cloudflare cannot proxy.
-- **`*.tunnel.example.com`** — must use **grey cloud** (DNS only). Caddy serves the wildcard TLS certificate directly via Let's Encrypt DNS-01 challenge. Cloudflare's Universal SSL wildcard provisioning is unreliable for per-tunnel subdomains.
-- **SSL/TLS mode** — must be set to **Full (strict)** in Cloudflare Dashboard > SSL/TLS. "Flexible" causes an infinite 308 redirect loop (Cloudflare connects HTTP to origin, Caddy redirects to HTTPS, loop).
-
-Wait for DNS propagation before proceeding (usually a few minutes).
-
-## Configuration
-
-### 1. Create `.env`
-
-```bash
 cp .env.example .env
 ```
 
-### 2. Set required variables
+Set these five values:
 
-Edit `.env`:
-
-```bash
-# Your domain
+```dotenv
 HATCHWAY_DOMAIN=example.com
-
-# Strong PostgreSQL password (generate with: openssl rand -hex 24)
-POSTGRES_PASSWORD=<random-24-byte-hex>
-
-# Plugin secret: frps→server plugin auth. Server-internal — never
-# returned to API users. Generate with: openssl rand -hex 32
-HATCHWAY_PLUGIN_SECRET=<random-32-byte-hex>
-
-# frps↔frpc bootstrap secret. Returned to API users in the create-tunnel
-# response so frpc can authenticate to frps. Should be a separate value from
-# HATCHWAY_PLUGIN_SECRET. Generate with: openssl rand -hex 32
-HATCHWAY_FRPS_AUTH_TOKEN=<random-32-byte-hex>
-
-# Cloudflare API token for DNS-01 wildcard certificate challenge.
-# Requires Zone > DNS > Edit permission for your domain.
-CLOUDFLARE_API_TOKEN=<your-cloudflare-api-token>
+POSTGRES_PASSWORD=<generated-password>
+HATCHWAY_PLUGIN_SECRET=<generated-secret>
+HATCHWAY_FRPS_AUTH_TOKEN=<different-generated-secret>
+CLOUDFLARE_API_TOKEN=<scoped-cloudflare-token>
 ```
 
-> **Templated configs:** `frps.toml` is rendered from `frps.toml.tmpl` at frps
-> container start (via `envsubst` in the entrypoint), and `Caddyfile` reads
-> `{$HATCHWAY_API_DOMAIN}` / `{$HATCHWAY_TUNNEL_DOMAIN}` / `{$CLOUDFLARE_API_TOKEN}`
-> from the environment. Both pick up values from `.env` via `docker compose`.
-> You should not see any placeholder strings (`example.com`, `CHANGE_ME_…`) in a
-> healthy stack — if you do, your `.env` is missing a value.
-
-### 3. Optional overrides
+Generate the values in your shell and paste the outputs:
 
 ```bash
-# PostgreSQL (defaults shown)
-POSTGRES_DB=hatchway
-POSTGRES_USER=hatchway
+openssl rand -hex 24
+openssl rand -hex 32
+openssl rand -hex 32
+```
 
-# Domain overrides (default to subdomains of HATCHWAY_DOMAIN)
+Do not put a literal `$(openssl ...)` expression in `.env`; Compose does not
+execute dotenv values.
+
+Restrict the completed file because it contains database and service secrets:
+
+```bash
+chmod 600 .env
+```
+
+The optional domain variables may be left empty to derive
+`api.${HATCHWAY_DOMAIN}`, `frps.${HATCHWAY_DOMAIN}`, and
+`tunnel.${HATCHWAY_DOMAIN}`, or set explicitly:
+
+```dotenv
 HATCHWAY_API_DOMAIN=api.example.com
 HATCHWAY_FRPS_DOMAIN=frps.example.com
 HATCHWAY_TUNNEL_DOMAIN=tunnel.example.com
+```
 
-# Tunnel limits
+### Secret roles
+
+Keep the two Hatchway secrets distinct:
+
+- `HATCHWAY_PLUGIN_SECRET` is embedded in the internal frps callback and Caddy
+  request-gate paths and is never returned through the API. Hatchway also
+  derives the AES-GCM key for cached idempotency response bodies from it.
+- `HATCHWAY_FRPS_AUTH_TOKEN` is the shared frps authentication token. Tunnel
+  creators receive it as `frp.server_token`; it is a bootstrap barrier, not
+  the tunnel-ownership boundary.
+
+Both values must contain 32–256 URL-safe characters: ASCII letters, digits,
+underscores, or hyphens. The hexadecimal `openssl` examples satisfy this
+constraint.
+
+Per-tunnel `rt_...` credentials enforce ownership in the plugin. They are
+returned once during tunnel creation, stored only as digests, and expire with
+their tunnel.
+
+Rotating the plugin secret requires a coordinated restart of Hatchway, frps,
+and Caddy. It also prevents decryption of cached idempotency responses written
+under the old value. Prefer to wait for
+`HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` plus one hourly sweeper interval before
+rotation, or plan for clients to retry affected requests with new keys.
+
+### Optional settings
+
+The Compose file passes these `.env` settings into the server:
+
+```dotenv
+POSTGRES_DB=hatchway
+POSTGRES_USER=hatchway
+
 HATCHWAY_MAX_CONCURRENT_TUNNELS=5
 HATCHWAY_MAX_TTL=24h
 HATCHWAY_RATE_CREATE_PER_MIN=10
+HATCHWAY_MAX_REQUEST_BYTES=65536
 
-# Server timeouts
 HATCHWAY_API_READ_TIMEOUT=30s
 HATCHWAY_API_WRITE_TIMEOUT=30s
-
-# How long the frps plugin handler may take before returning.
-# frps treats timeouts as failures, so don't set this below a typical DB query.
 HATCHWAY_PLUGIN_TIMEOUT=2s
 
-# Logging
 HATCHWAY_LOG_USER_CONNS=false
+HATCHWAY_EVENTS_RETENTION_DAYS=30
+HATCHWAY_IDEMPOTENCY_RETENTION_HOURS=24
+HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS=7
 ```
+
+Invalid integer, boolean, or Go duration values stop startup. The concurrent
+limit is per user and counts `reserved`, `active`, and `closed` tunnels. The
+creation rate is per API token and per Hatchway process.
 
 ## Deploy
 
-### 1. Start the stack
-
 ```bash
-docker compose up -d
-```
-
-Verify all services are healthy:
-
-```bash
+docker compose up -d --build
 docker compose ps
 ```
 
-### 2. Bootstrap the database
+`hatchway server run` applies embedded migrations before accepting traffic,
+then verifies the required schema. The current schema history is `0001`
+through `0006`. A failed migration stops the server rather than serving
+against an incompatible schema.
+
+The bundled services use health checks and dependency conditions:
+
+- PostgreSQL checks the configured database;
+- Hatchway runs `server healthcheck` against its internal `/readyz`;
+- frps verifies its rendered configuration and process; and
+- Caddy checks its admin endpoint and Hatchway readiness.
+
+Application containers use read-only filesystems where practical, dropped
+capabilities, PID limits, and rotated Docker JSON logs. The internal Hatchway
+listener and frps vhost port are not host-published. PostgreSQL is additionally
+isolated on a backend network joined only by the Hatchway server.
+
+The bundled Caddyfile performs a `forward_auth` subrequest before every
+wildcard tunnel request and sends traffic to frps only after Hatchway returns
+`204`. This is required for immediate HTTP revocation and expiry. If you
+replace Caddy, preserve the equivalent fail-closed request gate; routing
+`*.tunnel.example.com` directly to frps bypasses it.
+
+### Bootstrap the first admin
+
+After PostgreSQL and Hatchway are healthy:
 
 ```bash
-docker compose run --rm hatchway-server server init
+docker compose run --rm hatchway-server \
+  server init --admin-email admin@example.com --admin-name admin
 ```
 
-> **Note:** The container's ENTRYPOINT is already `/hatchway`, so use
-> `docker compose run --rm hatchway-server server init` (not `exec` and not
-> `hatchway server init` — the binary name is implicit).
+The image entrypoint is `/hatchway`, so the argument starts with `server`; do
+not write `hatchway server init` after the service name.
 
-This command:
-- Runs database migrations
-- Creates the admin user
-- Prints the first API token to stdout
+`server init` also runs migrations, then creates an admin and prints a
+one-time plaintext API token. Save it securely. Re-running without `--force`
+refuses when users exist. `--force` is additive after confirmation: it does
+not reset data or revoke existing tokens, and therefore needs a unique email.
 
-**Save this token** — it is shown exactly once.
-
-If you need to reinitialize (e.g. in development):
+### Verify from outside
 
 ```bash
-docker compose run --rm hatchway-server server init --force
+curl -fsS https://api.example.com/healthz
+curl -fsS https://api.example.com/readyz
+curl -fsS \
+  -H "Authorization: Bearer sk_live_..." \
+  https://api.example.com/v1/me
 ```
 
-### 3. Verify
+Expected `/v1/me` response:
 
-```bash
-curl -sf https://api.example.com/healthz
-curl -sf https://api.example.com/readyz
+```json
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "is_admin": true
+}
 ```
 
-Both should return `200 OK`.
-
-## First tunnel
-
-### Option A: Using the Hatchway CLI (recommended)
-
-#### 1. Configure the client
+You can also run the readiness probe inside the image:
 
 ```bash
-hatchway auth set-token --server https://api.example.com sk_live_abc123...
+docker compose run --rm hatchway-server \
+  server healthcheck --url http://hatchway-server:9000/readyz --timeout 3s
 ```
 
-#### 2. Verify authentication
+## Create the first tunnel
+
+Install the client and an executable frpc v0.69.0. `hatchway` searches for
+frpc first beside its own executable, then on `PATH`.
 
 ```bash
+hatchway auth set-token \
+  --server https://api.example.com \
+  sk_live_...
+
 hatchway auth whoami
 ```
 
-#### 3. Create a tunnel
-
-Start a local server (e.g. a Python HTTP server):
+Start a local service:
 
 ```bash
 python3 -m http.server 3000
@@ -213,224 +238,192 @@ In another terminal:
 hatchway http 3000 --ttl 15m
 ```
 
-This prints a public URL. Visit it in a browser to confirm traffic reaches your local server.
+The printed HTTPS URL should reach the local process. The client generates a
+temporary `frpc.toml`, runs frpc, restarts it up to three times after
+unexpected failures, and revokes the tunnel when the command exits. Ctrl-C is
+therefore the normal teardown.
 
-#### 4. Tear down
-
-Press Ctrl-C in the terminal running `hatchway http`. The tunnel is cleaned up automatically.
-
-### Option B: Using frpc directly
-
-If the Hatchway CLI is not yet installed, you can test with frpc manually.
-
-#### 1. Create a tunnel via the API
-
-```bash
-curl -X POST https://api.example.com/v1/tunnels \
-  -H "Authorization: Bearer sk_live_abc123..." \
-  -H "Content-Type: application/json" \
-  -d '{"type":"http","local_port":8080,"ttl_seconds":300}'
-```
-
-Save the `runtime_token`, `tunnel_id`, and `server_token` from the response.
-
-#### 2. Create an frpc config file
-
-frpc requires a TOML config file — CLI flags cannot set client-level metadatas:
+To run frpc manually instead, call `POST /v1/tunnels` and use the returned
+fields:
 
 ```toml
 serverAddr = "frps.example.com"
 serverPort = 7000
+
 auth.method = "token"
-auth.token = "SERVER_TOKEN_FROM_API_RESPONSE"
-metadatas.runtime_token = "RUNTIME_TOKEN_FROM_API_RESPONSE"
+auth.token = "FRP_SERVER_TOKEN_FROM_RESPONSE"
+
+metadatas.runtime_token = "RUNTIME_TOKEN_FROM_RESPONSE"
 
 [[proxies]]
 name = "TUNNEL_ID"
 type = "http"
-localPort = 8080
+localIP = "127.0.0.1"
+localPort = 3000
 subdomain = "TUNNEL_ID"
 ```
 
-Key points:
-- `auth.token` is the `server_token` from the API response (your `HATCHWAY_FRPS_AUTH_TOKEN`).
-- `metadatas.runtime_token` uses dotted-key format, NOT a `[metas]` section.
-- `name` and `subdomain` must both equal the tunnel ID.
+`name` and `subdomain` must equal the issued tunnel ID. Client-level metadata
+must use `metadatas.runtime_token`; a proxy-level metadata flag does not place
+the credential in frps's `Login` callback.
 
-#### 3. Start frpc
+## Users, tokens, and tunnels
 
-```bash
-python3 -m http.server 8080 &
-./frpc -c frpc.toml
-```
-
-frpc prints `login to server success` and `start proxy success`, then stays running.
-
-#### 4. Test
-
-```bash
-curl https://TUNNEL_ID.tunnel.example.com
-```
-
-You should see your local HTTP server's response.
-
-## Managing users and tokens
-
-### Create a user
+These commands access the database as a trusted host operator:
 
 ```bash
 docker compose run --rm hatchway-server \
   server user create --email alice@example.com --name Alice
-```
 
-### Create an API token for a user
-
-```bash
-docker compose run --rm hatchway-server \
-  server token create --user alice@example.com --name "laptop"
-```
-
-### List users
-
-```bash
 docker compose run --rm hatchway-server server user list
+
+docker compose run --rm hatchway-server \
+  server token create --user alice@example.com --name laptop
+
+docker compose run --rm hatchway-server \
+  server token list --user alice@example.com
+
+docker compose run --rm hatchway-server \
+  server token revoke <full-token-uuid>
+
+docker compose run --rm hatchway-server server tunnels
 ```
 
-### Revoke a token
+`token create --user` accepts UUID, email, or unique name and prints both the
+token UUID and one-time plaintext value. Use `token list` to rediscover IDs;
+the token body cannot be recovered.
+
+End users should use owner-scoped API/CLI operations:
 
 ```bash
-docker compose run --rm hatchway-server \
-  server token revoke <token-id>
+hatchway list
+hatchway delete <tunnel-id>
 ```
 
-### Admin revoke a tunnel
+`list` includes terminal rows. `delete` means revoke, not physical deletion.
+New user connections are rejected after revocation or TTL expiry, including
+when frps still has a registered proxy. Connections already accepted can
+drain naturally.
 
-> Server-side commands (`hatchway server tunnels`, `server user create`, `server token revoke`)
-> read the database directly and do **not** go through the API or `AdminOnly` middleware.
-> They assume operator-on-host trust: anyone who can `docker compose run --rm hatchway-server …`
-> can list and modify any tunnel. End-user tooling should always go through the API
-> with a Bearer token.
-
-The endpoint requires the caller's token to belong to a user with `is_admin = true`.
-Bootstrap admins are created by `hatchway server init`; create additional admins via:
+An admin API token may revoke any tunnel:
 
 ```bash
-docker compose run --rm hatchway-server \
-  server user create --email ops@example.com --name Ops --admin
+curl -X POST \
+  -H "Authorization: Bearer sk_live_<admin-token>" \
+  https://api.example.com/v1/admin/tunnels/<tunnel-id>/revoke
+```
+
+That is the only current public admin route. The server-side user/token/list
+commands are not exposed over HTTP.
+
+## Monitoring
+
+Public health endpoints:
+
+- `/healthz` — process liveness, plain-text `ok`;
+- `/readyz` — database ping plus required-schema check.
+
+The internal `http://hatchway-server:9001/metrics` endpoint exposes:
+
+| Metric | Type |
+| --- | --- |
+| `hatchway_plugin_ops_total{op=...}` | counter |
+| `hatchway_plugin_deadline_exceeded_total` | counter |
+| `hatchway_rate_limit_rejections_total` | counter |
+| `hatchway_tunnel_transitions_total` | counter |
+| `hatchway_tunnels_by_status{status=...}` | gauge |
+| `hatchway_db_pool_total_connections` | gauge |
+| `hatchway_db_pool_idle_connections` | gauge |
+
+Put a Prometheus scraper on `hatchway_internal`; do not publish 9001. Hatchway
+logs one JSON object per line. Completed API request logs include request ID,
+method, path, status, latency, and authenticated token ID.
+
+## Retention and expiry
+
+The server starts:
+
+- a 30-second reaper that transitions elapsed non-terminal tunnels to
+  `expired`; and
+- hourly sweepers for old events, idempotency rows, and dead runtime-token
+  rows.
+
+The Caddy request gate compares `expires_at` against PostgreSQL time before
+each wildcard HTTP request, so the reaper interval does not grant an extra 30
+seconds of new access.
+
+## Troubleshooting
+
+### API redirect loop
+
+Set a proxied Cloudflare API record to **Full (strict)**, not Flexible.
+
+### Wildcard certificate failure
+
+Confirm the Cloudflare token has both Zone Read and DNS Edit on the correct
+zone, the wildcard record exists, and Caddy received the token. Keep
+`*.tunnel` DNS-only.
+
+### frpc times out on port 7000
+
+Open the provider/host firewall and keep the frps DNS record DNS-only:
+
+```bash
+nc -vz frps.example.com 7000
+```
+
+### frpc reports missing or invalid credentials
+
+- `auth.token` must be the create response's `frp.server_token`.
+- `metadatas.runtime_token` must be the create response's `runtime_token`.
+- Never put `HATCHWAY_PLUGIN_SECRET` in a client config.
+- Confirm `name` and `subdomain` equal the tunnel ID.
+
+### Tunnel URL returns 502
+
+Check all sides:
+
+```bash
+docker compose ps
+docker compose logs hatchway-server frps caddy
+hatchway list
+```
+
+Confirm the local service is still listening and frpc is still running.
+Expired/revoked tunnels intentionally reject new connections.
+
+### Readiness fails
+
+```bash
+docker compose logs postgres hatchway-server
+docker compose exec postgres sh -c \
+  'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+A migration error or missing table makes `/readyz` fail.
+
+## Back up and upgrade
+
+Back up PostgreSQL before an upgrade:
+
+```bash
+docker compose exec -T postgres \
+  sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  > hatchway-backup.sql
 ```
 
 Then:
 
 ```bash
-curl -X POST https://api.example.com/v1/admin/tunnels/<tunnel-id>/revoke \
-  -H "Authorization: Bearer sk_live_<admin-token>"
-```
-
-Non-admin tokens get `403 FORBIDDEN`.
-
-## Monitoring
-
-### Health endpoints
-
-- `GET /healthz` — always returns `200 OK` (cheap liveness check)
-- `GET /readyz` — returns `200 OK` if the database is reachable; `503` otherwise
-
-### Prometheus metrics
-
-Metrics are served on the **internal** plugin port (`:9001`) — not publicly exposed. To scrape them, run Prometheus on the same Docker network or use an internal endpoint:
-
-```
-GET http://hatchway-server:9001/metrics
-```
-
-> **Trust boundary:** the plugin port is unauthenticated. Anything reachable on the `hatchway_internal` network (frps, Caddy, your Prometheus sidecar) sees tunnel counts, plugin op counters, and DB pool stats. Verify it never appears in any `ports:` block in `docker-compose.yml` or in your firewall rules. Putting Prometheus on the same Docker network is the supported pattern; exposing `:9001` to a host or VPC network is not.
-
-Metrics exposed:
-
-| Metric                                    | Type    | Description                                                                          |
-| ----------------------------------------- | ------- | ------------------------------------------------------------------------------------ |
-| `hatchway_plugin_ops_total`               | counter | frps plugin operations (Login, NewProxy, CloseProxy, NewUserConn, Ping, NewWorkConn) |
-| `hatchway_plugin_deadline_exceeded_total` | counter | Plugin handler invocations that hit `HATCHWAY_PLUGIN_TIMEOUT`                        |
-| `hatchway_rate_limit_rejections_total`    | counter | API rate limit rejections                                                            |
-| `hatchway_tunnel_transitions_total`       | counter | State machine transitions                                                            |
-| `hatchway_tunnels_by_status`              | gauge   | Current tunnels per status                                                           |
-| `hatchway_db_pool_total_connections`      | gauge   | PostgreSQL pool total connections                                                    |
-| `hatchway_db_pool_idle_connections`       | gauge   | PostgreSQL pool idle connections                                                     |
-
-## Troubleshooting
-
-### `308` redirect loop on API
-
-Cloudflare SSL/TLS mode is set to "Flexible". Set it to **Full (strict)** in the Cloudflare dashboard.
-
-### frps crash-loop: `unknown field "headers"`
-
-frps does not support custom headers in `httpPlugins` config. The plugin secret should be embedded in the plugin callback URL path, not as a header. Ensure you're using the latest `frps.toml.tmpl`.
-
-### hatchway-server crash-loop: `unknown command "hatchway"`
-
-The Dockerfile ENTRYPOINT is already `/hatchway`. The docker-compose command should be `["server", "run"]`, not `["hatchway", "server", "run"]`.
-
-### frpc: `i/o timeout` on port 7000
-
-The cloud provider firewall is blocking port 7000. Add a firewall rule for tcp:7000 (see "Open firewall ports" above). Also verify that `frps.example.com` uses grey cloud (DNS only) if behind Cloudflare — Cloudflare cannot proxy raw TCP.
-
-### frpc: `missing runtime token`
-
-The `--metadatas` CLI flag sets proxy-level metas, not client-level metas that appear in the Login message. Use a TOML config file with `metadatas.runtime_token = "..."` (dotted-key format) instead.
-
-### frpc: `invalid credentials`
-
-The `auth.token` in `frpc.toml` must be the `HATCHWAY_FRPS_AUTH_TOKEN` (returned as `server_token` in the API response), not the `runtime_token` or `HATCHWAY_PLUGIN_SECRET`. Also verify the frps entrypoint is correctly substituting all environment variables.
-
-### SSL handshake failure on tunnel URL
-
-If `*.tunnel.example.com` is behind a Cloudflare proxy (orange cloud), Cloudflare's Universal SSL wildcard cert may not cover the subdomain. Switch to grey cloud (DNS only) and let Caddy serve the Let's Encrypt wildcard cert directly.
-
-Also verify that `CLOUDFLARE_API_TOKEN` is set in `.env` — Caddy needs it for the DNS-01 challenge to obtain the wildcard certificate.
-
-### Tunnels don't connect (502 errors)
-
-1. Check frps is running: `docker compose logs frps`
-2. Verify the plugin secret matches in `.env`
-3. Check that frpc can reach `frps.example.com:7000`
-
-### Certificate renewal fails
-
-Caddy handles TLS automatically via ACME DNS-01 challenge. Ensure:
-- Port 80 and 443 are open
-- DNS records point to the correct IP
-- The `*.tunnel.example.com` wildcard record exists
-- `CLOUDFLARE_API_TOKEN` is set and valid
-
-### Database connection errors
-
-```bash
-docker compose exec postgres pg_isready -U hatchway
-docker compose logs postgres
-```
-
-### Plugin port accidentally exposed
-
-The plugin port (`:9001`) must not be in the `ports:` section of `docker-compose.yml`. If it is, remove it — the plugin is only for internal frps communication.
-
-### Reset everything
-
-```bash
-docker compose down -v   # removes containers AND volumes
-docker compose up -d
-docker compose run --rm hatchway-server server init --force
-```
-
-## Updating
-
-```bash
 git pull
 docker compose up -d --build
+curl -fsS https://api.example.com/readyz
 ```
 
-Database migrations run automatically via `hatchway server run` on startup. For manual migration:
+No separate migration command is required; `server run` migrates on startup.
+Do not use `server init` as a manual migration command because it also attempts
+to create an admin.
 
-```bash
-docker compose run --rm hatchway-server server init
-```
+To deliberately destroy a development deployment, `docker compose down -v`
+removes the PostgreSQL and Caddy volumes. That data is not recoverable unless
+you made a backup.

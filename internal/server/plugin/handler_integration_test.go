@@ -6,18 +6,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/zydo/hatchway/internal/config"
 	"github.com/zydo/hatchway/internal/db"
+	"github.com/zydo/hatchway/internal/testutil"
 	"github.com/zydo/hatchway/internal/tokens"
 )
 
@@ -40,25 +37,7 @@ func setupPluginFixture(t *testing.T) *pluginFixture {
 		t.Skip("skipping integration test")
 	}
 
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		ctx := context.Background()
-		c, err := postgres.Run(ctx,
-			"postgres:16",
-			postgres.WithDatabase("hatchway_test"),
-			postgres.WithUsername("hatchway"),
-			postgres.WithPassword("hatchway_test"),
-			testcontainers.WithWaitStrategy(
-				wait.ForListeningPort("5432/tcp"),
-				wait.ForLog("database system is ready to accept connections"),
-			),
-		)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = c.Terminate(ctx) })
-
-		connStr, err = c.ConnectionString(ctx, "sslmode=disable")
-		require.NoError(t, err)
-	}
+	connStr := testutil.DatabaseURL(t)
 
 	require.NoError(t, db.RunMigrations(connStr))
 
@@ -97,12 +76,23 @@ func setupPluginFixture(t *testing.T) *pluginFixture {
 
 	return &pluginFixture{
 		pool:       database.Pool,
-		cfg:        &config.Config{PluginSecret: "plugin-secret"},
+		cfg:        &config.Config{PluginSecret: "plugin-secret", TunnelDomain: "tunnel.example.com"},
 		userID:     userID,
 		tunnelID:   tunnelID,
 		runtimeTok: rt.Raw,
 		tokenID:    tokenID,
 	}
+}
+
+func callTunnelAuthorization(t *testing.T, f *pluginFixture, secret, host string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/internal/tunnels/authorize/"+secret, nil)
+	req.Header.Set(TunnelHostHeader, host)
+	rec := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/internal/tunnels/authorize/{secret}", TunnelAuthorizationHandler(f.pool, f.cfg))
+	mux.ServeHTTP(rec, req)
+	return rec
 }
 
 func callPluginOp(t *testing.T, f *pluginFixture, transitionFn TransitionFunc, op string, body any) *PluginResponse {
@@ -168,6 +158,36 @@ func TestPluginIntegration_LoginRejectsExpiredToken(t *testing.T) {
 	}
 }
 
+func TestPluginIntegration_LoginRejectsUnavailableTunnel(t *testing.T) {
+	tests := []struct {
+		name   string
+		update string
+	}{
+		{
+			name:   "terminal",
+			update: "UPDATE tunnels SET status = 'revoked' WHERE id = $1",
+		},
+		{
+			name:   "elapsed",
+			update: "UPDATE tunnels SET expires_at = now() - interval '1 minute' WHERE id = $1",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := setupPluginFixture(t)
+			_, err := f.pool.Exec(context.Background(), tt.update, f.tunnelID)
+			require.NoError(t, err)
+
+			resp := callPluginOp(t, f, nil, "Login", map[string]any{
+				"content": LoginContent{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			})
+			if !resp.Reject {
+				t.Error("login should reject a runtime token for an unavailable tunnel")
+			}
+		})
+	}
+}
+
 func TestPluginIntegration_LoginRejectsWrongHashWithPrefixCollision(t *testing.T) {
 	f := setupPluginFixture(t)
 	// Stash a second row with the same prefix but a hash that won't match —
@@ -206,7 +226,7 @@ func TestPluginIntegration_NewProxyAcceptsAndTransitions(t *testing.T) {
 
 	resp := callPluginOp(t, f, transitionFn, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:      NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:      NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName: f.tunnelID,
 			ProxyType: "http",
 			Subdomain: f.tunnelID,
@@ -224,7 +244,7 @@ func TestPluginIntegration_NewProxyRejectsProxyNameMismatch(t *testing.T) {
 	f := setupPluginFixture(t)
 	resp := callPluginOp(t, f, nil, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:      NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:      NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName: "t-wrong0000000000",
 			ProxyType: "http",
 			Subdomain: f.tunnelID,
@@ -239,7 +259,7 @@ func TestPluginIntegration_NewProxyRejectsSubdomainMismatch(t *testing.T) {
 	f := setupPluginFixture(t)
 	resp := callPluginOp(t, f, nil, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:      NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:      NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName: f.tunnelID,
 			ProxyType: "http",
 			Subdomain: "wrong-subdomain",
@@ -254,7 +274,7 @@ func TestPluginIntegration_NewProxyRejectsCustomDomains(t *testing.T) {
 	f := setupPluginFixture(t)
 	resp := callPluginOp(t, f, nil, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:          NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:          NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName:     f.tunnelID,
 			ProxyType:     "http",
 			Subdomain:     f.tunnelID,
@@ -270,7 +290,7 @@ func TestPluginIntegration_NewProxyRejectsNonHTTP(t *testing.T) {
 	f := setupPluginFixture(t)
 	resp := callPluginOp(t, f, nil, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:      NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:      NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName: f.tunnelID,
 			ProxyType: "tcp",
 			Subdomain: f.tunnelID,
@@ -289,7 +309,7 @@ func TestPluginIntegration_NewProxyRejectsTerminalTunnel(t *testing.T) {
 
 	resp := callPluginOp(t, f, nil, "NewProxy", map[string]any{
 		"content": NewProxyContent{
-			User:      NewProxyUser{Metas: map[string]string{"runtime_token": f.runtimeTok}},
+			User:      NewProxyUser{RunID: "run-new", Metas: map[string]string{"runtime_token": f.runtimeTok}},
 			ProxyName: f.tunnelID,
 			ProxyType: "http",
 			Subdomain: f.tunnelID,
@@ -316,7 +336,7 @@ func TestPluginIntegration_CloseProxyTransitionsActiveToClosed(t *testing.T) {
 	}
 
 	resp := callPluginOp(t, f, transitionFn, "CloseProxy", map[string]any{
-		"content": CloseProxyContent{ProxyName: f.tunnelID},
+		"content": CloseProxyContent{User: NewProxyUser{RunID: "run-active"}, ProxyName: f.tunnelID},
 	})
 	if resp.Reject {
 		t.Errorf("CloseProxy should not reject, got: %s", resp.RejectReason)
@@ -359,6 +379,8 @@ func TestPluginIntegration_CloseProxyUnknownTunnel(t *testing.T) {
 func TestPluginIntegration_NewUserConnEmitsEventWhenEnabled(t *testing.T) {
 	f := setupPluginFixture(t)
 	f.cfg.LogUserConns = true
+	_, err := f.pool.Exec(context.Background(), "UPDATE tunnels SET status = 'active' WHERE id = $1", f.tunnelID)
+	require.NoError(t, err)
 
 	resp := callPluginOp(t, f, nil, "NewUserConn", map[string]any{
 		"content": NewUserConnContent{
@@ -376,6 +398,81 @@ func TestPluginIntegration_NewUserConnEmitsEventWhenEnabled(t *testing.T) {
 		"SELECT COUNT(*) FROM tunnel_events WHERE tunnel_id=$1 AND event_type='NewUserConn'", f.tunnelID).Scan(&count))
 	if count != 1 {
 		t.Errorf("expected 1 NewUserConn event, got %d", count)
+	}
+}
+
+func TestTunnelAuthorizationIntegration(t *testing.T) {
+	f := setupPluginFixture(t)
+	ctx := context.Background()
+	host := f.tunnelID + "." + f.cfg.TunnelDomain
+
+	_, err := f.pool.Exec(ctx, "UPDATE tunnels SET status = 'active', expires_at = now() + interval '1 hour' WHERE id = $1", f.tunnelID)
+	require.NoError(t, err)
+	if got := callTunnelAuthorization(t, f, f.cfg.PluginSecret, host).Code; got != http.StatusNoContent {
+		t.Fatalf("active tunnel status = %d, want %d", got, http.StatusNoContent)
+	}
+	_, err = f.pool.Exec(ctx, "UPDATE tunnels SET status = 'closed' WHERE id = $1", f.tunnelID)
+	require.NoError(t, err)
+	if got := callTunnelAuthorization(t, f, f.cfg.PluginSecret, host).Code; got != http.StatusNoContent {
+		t.Fatalf("closed tunnel status = %d, want %d", got, http.StatusNoContent)
+	}
+
+	tests := []struct {
+		name   string
+		update string
+	}{
+		{name: "reserved", update: "UPDATE tunnels SET status = 'reserved', expires_at = now() + interval '1 hour' WHERE id = $1"},
+		{name: "revoked", update: "UPDATE tunnels SET status = 'revoked', expires_at = now() + interval '1 hour' WHERE id = $1"},
+		{name: "expired status", update: "UPDATE tunnels SET status = 'expired', expires_at = now() + interval '1 hour' WHERE id = $1"},
+		{name: "elapsed TTL", update: "UPDATE tunnels SET status = 'active', expires_at = now() - interval '1 second' WHERE id = $1"},
+		{name: "missing TTL", update: "UPDATE tunnels SET status = 'active', expires_at = NULL WHERE id = $1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := f.pool.Exec(ctx, tt.update, f.tunnelID)
+			require.NoError(t, err)
+			if got := callTunnelAuthorization(t, f, f.cfg.PluginSecret, host).Code; got != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+			}
+		})
+	}
+
+	if got := callTunnelAuthorization(t, f, f.cfg.PluginSecret, "t-unknown00000000."+f.cfg.TunnelDomain).Code; got != http.StatusForbidden {
+		t.Fatalf("unknown tunnel status = %d, want %d", got, http.StatusForbidden)
+	}
+}
+
+func TestPluginIntegration_NewUserConnRejectsTerminalOrExpiredTunnel(t *testing.T) {
+	tests := []struct {
+		name   string
+		update string
+	}{
+		{name: "revoked", update: "UPDATE tunnels SET status = 'revoked' WHERE id = $1"},
+		{name: "expired status", update: "UPDATE tunnels SET status = 'expired' WHERE id = $1"},
+		{name: "ttl elapsed before reaper", update: "UPDATE tunnels SET status = 'active', expires_at = now() - interval '1 second' WHERE id = $1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := setupPluginFixture(t)
+			_, err := f.pool.Exec(context.Background(),
+				"UPDATE tunnels SET status = 'active', expires_at = now() + interval '1 hour' WHERE id = $1",
+				f.tunnelID,
+			)
+			require.NoError(t, err)
+			_, err = f.pool.Exec(context.Background(), tt.update, f.tunnelID)
+			require.NoError(t, err)
+
+			resp := callPluginOp(t, f, nil, "NewUserConn", map[string]any{
+				"content": NewUserConnContent{
+					ProxyName:  f.tunnelID,
+					ProxyType:  "http",
+					RemoteAddr: "1.2.3.4:5678",
+				},
+			})
+			if !resp.Reject {
+				t.Fatal("NewUserConn should reject a terminal or elapsed tunnel")
+			}
+		})
 	}
 }
 

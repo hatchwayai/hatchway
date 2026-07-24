@@ -1,74 +1,101 @@
 # Extending Hatchway
 
-Hatchway is deliberately minimal: a token-authenticated tunnel control plane with no
-dashboard, no SSO, no MFA, and no built-in user-management UX. If you want those
-features, the recommended approach is **to build them around Hatchway, not into it**,
-so the core stays small and upgradable.
+Hatchway's supported integration boundary is its HTTP API and command-line
+interface. It is a standalone service, not a reusable Go library: all Go
+packages live under `internal/` and cannot be imported by another module.
 
-## Using Hatchway in another project
+## What is available today
 
-Hatchway is **not a Go library**. Every package lives under `internal/`, which Go
-forbids other modules from importing. There is no stable public Go API surface.
+The public API supports:
 
-Use Hatchway as a **standalone service** and integrate with it over HTTP:
+- inspecting the authenticated principal;
+- creating, listing, reading, and revoking that principal's tunnels; and
+- revoking any tunnel with an admin user's token.
 
-1. **Run it as a separate service** (via `docker-compose.yml` or the `hatchway`
-   binary) and call its HTTP API from your project using an `sk_live_…` token.
-   This is the intended integration model.
-2. **Shell out to the `hatchway` CLI** if you only need occasional tunnel
-   create/list operations — the CLI is JSON-first and scriptable.
-3. **Fork** (not vendor) if you genuinely need to modify Hatchway's behavior.
-   Keep it as its own repo/module so upstream changes remain mergeable.
+See [api.md](api.md) for the complete route list. In particular, the current
+server does **not** expose public APIs for:
 
-The MIT license permits all three; the choice is about integration architecture,
-not licensing.
+- creating or listing users;
+- minting, listing, or revoking API tokens;
+- listing tunnels across users;
+- reading tunnel events; or
+- impersonating another user.
 
-## Adding SSO / OAuth / MFA / WebUI without forking
+Those operations exist only as trusted, database-backed
+`hatchway server ...` commands where documented in [cli.md](cli.md).
 
-The clean pattern is to **build a separate "console" service alongside Hatchway**
-and have it own all the auth and UX features, talking to Hatchway only via its
-HTTP API. Hatchway stays as it is; the console becomes the human/SSO-facing layer.
+## Integration patterns
 
-Two complementary pieces:
+### Call the HTTP API
 
-### 1. A console app (your code, separate repo) — owns SSO / OAuth / MFA / WebUI
+For CI, agents, or another backend, use a dedicated `sk_live_...` token and
+call the owner-scoped endpoints. Send a unique `Idempotency-Key` when creating
+a tunnel and retain the returned tunnel ID for later revocation.
 
-- Handles login via your IdP (Okta, Google, Authelia, Keycloak, …) and MFA.
-- Holds a single admin `sk_live_…` token for Hatchway.
-- Maintains its own `console_user ↔ hatchway_user` mapping. On first SSO login,
-  it calls `/v1/admin/users` to provision the Hatchway user and stores the issued
-  `sk_live_…` per console-user (or just acts on their behalf with the admin token).
-- Serves the WebUI: list / create / revoke tunnels by calling `/v1/tunnels`,
-  show events, etc.
-- This is the cleanest split — Hatchway never learns about SSO, and you can
-  upgrade Hatchway without merge pain.
+If one external service manages tunnels for multiple people with one Hatchway
+token, Hatchway sees a single owning user. The external service must enforce
+its own tenant authorization and mapping. An admin token does not make normal
+`/v1/tunnels` calls cross-user; it only unlocks the explicit admin-revoke
+route.
 
-### 2. Optionally, an auth proxy in front of Hatchway's API
+### Invoke the CLI
 
-Only needed if you also want SSO on the `hatchway` CLI flow.
+Shelling out can be practical for local automation. `hatchway http --json`,
+`hatchway list --json`, and `hatchway auth whoami --json` have
+machine-readable success output. CLI-originated failures are still plain text
+on stderr, and `hatchway http` remains attached while frpc is running.
 
-- Drop `oauth2-proxy`, Authelia, or Caddy `forward_auth` in front of `:9000`.
-- The proxy enforces SSO + MFA, then injects the right
-  `Authorization: Bearer sk_live_…` header before forwarding to Hatchway.
-- Useful if humans currently `hatchway http 3000` from laptops and you want that
-  gated by SSO. Skip this if the CLI is only used by CI / agents with API tokens.
+For unattended callers, prefer `HATCHWAY_SERVER` and `HATCHWAY_TOKEN` over a
+shared credentials file. Remember that `hatchway http` requires `frpc` beside
+the Hatchway executable or on `PATH`.
 
-## What to avoid
+### Build a separate console
 
-- **Don't embed Hatchway as a Go library** — everything lives under `internal/`,
-  there is no stable public API surface.
-- **Don't proxy the frps plugin port (`:9001`)** — that is an internal control
-  channel for frps, not for humans.
-- **Don't share Hatchway's SQLite / Postgres directly** from the console. Go
-  through the HTTP API so Hatchway's invariants (token hashing, idempotency,
-  event log, quotas) stay enforced.
+A dashboard or SSO-facing console can live beside Hatchway and use the HTTP
+API for tunnel operations. With the current API, provision Hatchway users and
+their tokens through an operator-controlled workflow before handing a token to
+the console. Do not claim that the console can call an admin user-provisioning
+route; no such route exists.
 
-## Gaps you may hit (candidates for small additive upstream features)
+If a reverse auth proxy injects an `Authorization` header, it must:
 
-These keep Hatchway minimal but make a console viable:
+- remove any client-supplied authorization header;
+- map the authenticated identity to the correct Hatchway token;
+- protect that token as a secret; and
+- prevent one identity from selecting another identity's token.
 
-- A way to mint an API token on behalf of a user from the admin API (so the
-  console does not have to store an admin token forever).
-- Webhooks or an events stream so the console UI can update without polling.
-- A `created_by` / source field on tunnels so the WebUI can show who made what
-  when the admin token is the actual caller.
+The identity proxy should cover only the public API listener. Never expose the
+internal control listener (`:9001`) to end users.
+
+## Boundaries to preserve
+
+- Do not read or write PostgreSQL from an external application. Direct writes
+  bypass token handling, per-user quota serialization, lifecycle events,
+  idempotency, and ownership checks.
+- Do not reuse `HATCHWAY_PLUGIN_SECRET` or
+  `HATCHWAY_FRPS_AUTH_TOKEN` as an end-user API credential.
+- Do not store the one-time plaintext runtime token longer than needed to
+  launch frpc.
+- Do not assume an API `DELETE` removes a row. It transitions the tunnel to
+  `revoked`. The bundled Caddy request gate blocks subsequent HTTP requests;
+  requests already admitted, including upgraded connections, may drain.
+- If you replace Caddy or the data-plane routing, preserve its fail-closed
+  authorization subrequest before every wildcard HTTP request. It permits
+  non-elapsed `active`/`closed` rows because close callbacks are asynchronous,
+  but denies `reserved` and terminal rows. Direct wildcard proxying to frps
+  bypasses immediate revocation and expiry checks.
+- Fork the service if you need to change its internal behavior. Vendoring an
+  `internal/` package is not a stable extension contract.
+
+## Possible future APIs
+
+The following are design candidates, not implemented promises:
+
+- admin user and API-token lifecycle endpoints;
+- cross-user tunnel inventory for an operator console;
+- webhook or event-stream delivery;
+- a safe audit-event read API; and
+- provenance fields such as `created_by`.
+
+Any future endpoint should remain additive, owner-aware, and subject to the
+same JSON error, request-size, audit, and idempotency rules as the current API.

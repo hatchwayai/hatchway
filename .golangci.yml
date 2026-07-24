@@ -1,19 +1,34 @@
+version: "2"
+
 run:
   go: "1.26"
 
 linters:
   enable:
     - errcheck
+    - bodyclose
+    - errorlint
+    - godoclint
+    - gosec
     - govet
+    - ineffassign
+    - misspell
+    - nolintlint
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
     - staticcheck
     - unused
-    - gosimple
-    - ineffassign
-    - typecheck
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
+  settings:
+    errcheck:
+      check-type-assertions: true
+  exclusions:
+    rules:
+      # Security tests intentionally use recognizable fake credentials and
+      # insecure permissions to verify that production code rejects them.
+      - path: _test\.go
+        linters:
+          - gosec
 
 issues:
   max-issues-per-linter: 50

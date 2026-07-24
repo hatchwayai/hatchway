@@ -1,261 +1,254 @@
 # Hatchway Development Plan
 
-Source of truth for implementation progress. Edit checkboxes in place as you complete work. The design itself lives in `DESIGN.md` — this file tracks what is built vs. not built.
+> **Historical roadmap, reconciled 2026-07-24.** This file records how the
+> current implementation was assembled and what release work remains. It is
+> not the behavioral source of truth: use `DESIGN.md`, `docs/api.md`, and
+> `docs/cli.md` for the current contract.
 
-## How to use this file
-
-- Each task is a `- [ ]` checkbox. Tick it (`- [x]`) when the work is done **and** the exit criteria for the containing phase are still satisfied.
-- Phases are roughly sequenced. Within a phase, tasks marked **(parallel)** can be done concurrently.
-- When the design changes, reflect it in `DESIGN.md` first, then add/strike tasks here.
-- When resuming after a gap: re-read `DESIGN.md` (it may have drifted), scan this file's "Open questions" section, then pick the lowest unchecked task in the lowest unfinished phase.
-- **Every phase's exit criteria includes passing unit tests for that phase's code.** Do not defer all testing to Phase 10 — write tests for security-critical paths (token verify, state machine, plugin authorization) alongside the implementation. Phase 10 covers comprehensive integration and E2E testing.
+Checkboxes mean the corresponding capability exists in the repository. They
+do not promise that a release artifact has been published. Unchecked
+post-MVP items are proposals, not active API commitments.
 
 ## Status snapshot
 
-- Current phase: **Complete (all phases done)**
-- Last updated: 2026-05-14
-- Phase 0–11 complete.
+- Implementation phases 0–10: complete for the current HTTP-only scope.
+- Documentation reconciliation: complete in the working tree.
+- Release/tag/publication: pending; this repository currently has no release
+  tag.
+- Current schema migrations: `0001` through `0006`.
 
----
+## Phase 0 — Repository bootstrap
 
-## Phase 0 — Repo bootstrap
+**Goal:** one Go module and one `hatchway` binary with repeatable development
+commands.
 
-**Goal:** an empty `hatchway` binary that builds, tests, and lints, with the directory layout from DESIGN.md in place.
+- [x] Initialize `github.com/zydo/hatchway`.
+- [x] Use Cobra for the command tree and `slog` for logging.
+- [x] Add version injection through the Makefile and GoReleaser.
+- [x] Add `build`, `test`, `test-short`, `coverage`, `lint`, `fmt`, and `tidy`
+  Make targets.
+- [x] Run build, lint, unit, integration, and vulnerability checks in CI as
+  configured by the workflows.
 
-**Exit criteria:** `go build ./...`, `go test ./...`, and the linter all pass on a fresh clone. `hatchway --help` runs and prints a top-level command list.
+## Phase 1 — PostgreSQL and migrations
 
-- [x] `git init` and add `.gitignore` (Go, IDE, `dist/`, `.env`).
-- [x] `go mod init github.com/zydo/hatchway`.
-- [x] Create the directory tree from `DESIGN.md` § Codebase and Packaging Strategy. Empty `.gitkeep` files in leaf dirs to commit them.
-- [x] `cmd/hatchway/main.go` — minimal Cobra root with `server` and `auth` subcommand stubs. Include a `hatchway version` subcommand that prints the embedded version (set via `ldflags` in the Makefile).
-- [x] CLI library: **Cobra**.
-- [x] Logger: **slog** (stdlib).
-- [x] `Makefile` with `build`, `test`, `lint`, `fmt`, `tidy`.
-- [x] `golangci-lint` config tuned for Go 1.22+ defaults.
-- [x] CI: GitHub Actions workflow that runs `make lint test build` on push/PR.
+**Goal:** an embedded, upgradeable control-plane schema.
 
-## Phase 1 — Database & migrations
+- [x] Use pgx/v5 and golang-migrate with an embedded filesystem.
+- [x] `0001`: users, API tokens, tunnels, runtime tokens, events, idempotency,
+  and initial indexes.
+- [x] `0002`: admin role.
+- [x] `0003`: byte-exact idempotency response storage.
+- [x] `0004`: in-flight/completed idempotency state and removal of unused event
+  columns.
+- [x] `0005`: runtime-token-prefix and idempotency-retention indexes.
+- [x] `0006`: owner pagination and runtime-retention indexes plus database
+  constraints for ports, states, use counts, and idempotency completion.
+- [x] Make both `server run` and `server init` apply pending migrations.
+- [x] Make startup/readiness verify the required schema tables.
+- [x] Test migration up/down behavior against PostgreSQL.
 
-**Goal:** schema from `DESIGN.md` § PostgreSQL Data Model is creatable and revertible via the migration tool.
+There is no `server migrate` or `server init --dry-run` command. `server run`
+is the migration-only upgrade path; `server init` additionally creates an
+admin.
 
-**Exit criteria:** `hatchway server init --dry-run` connects, runs migrations against an empty Postgres, and reports success. All tables, indexes, and foreign keys exist.
+## Phase 2 — Operators, users, and API tokens
 
-- [x] Pick migration tool: golang-migrate (recommended for SQL files) vs goose. Document. → **golang-migrate**
-- [x] Add `pgx/v5` dependency.
-- [x] `internal/db` package: connection pool, ping, transaction helpers.
-- [x] Migration `0001_init.sql`: `users`, `api_tokens`, `tunnels`, `tunnel_runtime_tokens`, `tunnel_events`, `idempotency_keys`. Match column types exactly to DESIGN.md. Note: `users.email` has a `UNIQUE` constraint; `tunnel_events.tunnel_id` is `NOT NULL`; `tunnels` has no `deleted_at` column (revoked status handles lifecycle).
-- [x] Indexes: `api_tokens(token_prefix)`, `tunnel_runtime_tokens(tunnel_id, token_prefix)` and `tunnel_runtime_tokens(token_prefix)` (the plugin's hot Login/NewProxy lookup is by prefix alone; the composite index is kept because `revokeRuntimeTokens` still filters by `tunnel_id` alone — see migration 0005), `tunnels(user_id, status)`, `tunnels(expires_at) WHERE status IN ('reserved','active','closed')`, `tunnel_events(tunnel_id, created_at)`, `tunnel_events(created_at)`, `idempotency_keys(created_at)` for the retention sweep.
-- [x] Migration `down` files for each `up`.
-- [x] Repository structs in `internal/models` for each table.
-- [x] Integration test harness that spins up Postgres via `testcontainers-go` (or a docker-compose fixture) and runs migrations up→down→up.
+**Goal:** trusted host operators can bootstrap identities without a public
+self-signup surface.
 
-## Phase 2 — Server bootstrap & user/token management
+- [x] `server init` creates an admin and one-time token transactionally.
+- [x] Make `server init --force` explicit, confirmed, and additive.
+- [x] `server user create [--admin]` and `server user list [--json]`.
+- [x] `server token create --user ... --name ...` resolves UUID, email, or a
+  unique name and prints the token UUID.
+- [x] `server token list [--user UUID|email] [--json]` exposes revocable IDs
+  and non-secret metadata.
+- [x] `server token revoke <token-id>` revokes one live token.
+- [x] Mint high-entropy `sk_live_...` and `rt_...` values and store only a
+  lookup prefix plus a versioned SHA-256 digest.
+- [x] Preserve verification compatibility with legacy Argon2id PHC and
+  pre-PHC bare-hex rows, with a global concurrency bound on legacy KDF work.
 
-**Goal:** an operator can run `hatchway server init` against a fresh DB and get a usable admin API token.
+Public user/token administration endpoints remain out of scope.
 
-**Exit criteria:** `hatchway server init` → `hatchway server user create` → `hatchway server token create` chain works end-to-end on a clean DB. Tokens are hashed at rest, never logged.
+## Phase 3 — HTTP control-plane skeleton
 
-- [x] Config loader: env vars first, optional config file second. Twelve-factor. Include `HATCHWAY_API_READ_TIMEOUT` (default 30s) and `HATCHWAY_API_WRITE_TIMEOUT` (default 30s) for the API server.
-- [x] Token format: `sk_live_<base62>` for API tokens, `rt_<base62>` for runtime tokens. Implement a single `internal/tokens` package that mints and parses both. `token_prefix` = first 12 characters of the full token string (e.g. `sk_live_abc` from `sk_live_abcdef…`), used as a fast index lookup. Multiple tokens may share a prefix; hash comparison resolves collisions.
-- [x] Token hashing: **argon2id**. Parameters pinned in code (time=3, memory=64MB, threads=4, keyLen=32).
-- [x] `hatchway server init`: runs migrations, creates one admin user, mints its first API token, prints the token to stdout exactly once. Refuses to run if any user already exists (use `--force` to override for dev).
-- [x] `hatchway server user create --email <e> --name <n>`.
-- [x] `hatchway server user list` (table + `--json`).
-- [x] `hatchway server token create --user <email|name> --name <label>`. Prints token once, then never again.
-- [x] `hatchway server token revoke <token_id>`.
-- [x] `hatchway server tunnels list` (admin view across all users).
-- [x] Unit tests for token mint/parse/hash/verify; round-trip and tampering tests.
+**Goal:** bounded, authenticated HTTP service behavior.
 
-## Phase 3 — Control-plane HTTP server skeleton
+- [x] Public API listener on `:9000`; internal callback/gate/metrics listener on
+  `:9001`.
+- [x] `/healthz`, schema-aware `/readyz`, and
+  `server healthcheck [--url] [--timeout]`.
+- [x] Bearer authentication with prefix-collision-safe digest verification.
+- [x] Request body, header, read, write, idle, and plugin deadline bounds.
+- [x] JSON errors for handlers, unknown routes, and unsupported methods.
+- [x] JSON application/request logs with request ID, status, latency, and
+  authenticated token ID.
+- [x] Per-token, process-local create rate limiting.
+- [x] Idempotency reservations scoped by `(token_id, key)`.
+- [x] Bind idempotency keys to method, escaped path, raw query, and body.
+- [x] Encrypt replayable successful response bodies with AES-GCM derived from
+  the plugin secret; retain legacy plaintext reads for the retention window.
+- [x] Limit keys to 255 bytes and cached bodies to 4 KiB.
 
-**Goal:** a chi router with auth, idempotency, rate limit, error envelope, and `/healthz`. No tunnel routes yet.
+## Phase 4 — Tunnel API and lifecycle
 
-**Exit criteria:** `hatchway server run` listens on `:9000` (API) and `:9001` (plugin), the API rejects unauthenticated requests, idempotent replays return the cached response, and the rate limiter throttles excess creates.
+**Goal:** owner-scoped short-lived HTTP tunnels with race-safe quotas.
 
-- [x] HTTP framework: **chi**.
-- [x] Two listeners: `HATCHWAY_API_ADDR` (`:9000`) and `HATCHWAY_FRPS_PLUGIN_ADDR` (`:9001`). Plugin port refuses any path other than `/frp/plugin`. Apply `HATCHWAY_API_READ_TIMEOUT` and `HATCHWAY_API_WRITE_TIMEOUT` to the API server.
-- [x] Bearer-token auth middleware: parse `Authorization: Bearer sk_live_…`, look up by `token_prefix`, verify hash, attach `user_id` + `token_id` to request context. Constant-time compare on the hash check.
-- [x] JSON error envelope `{ "error": { "code": "...", "message": "..." } }`. Map common error codes upfront: `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `RATE_LIMITED`, `QUOTA_EXCEEDED`, `INVALID_REQUEST`, `LOCAL_PORT_NOT_REACHABLE`, `INTERNAL`.
-- [x] Idempotency middleware: read `Idempotency-Key`, hash request body, look up `(token_id, key)` in `idempotency_keys`. On hit, return the cached response. On miss, capture and store after the handler returns 2xx. Cap cached response body at 4 KB — larger responses are not cached but the request still proceeds.
-- [x] Rate-limit middleware: in-memory token-bucket per `token_id`. **Note:** in-memory means rates are per-process; for multi-replica deployments this needs to move to Postgres or Redis. Acceptable for MVP; document as a known limitation here.
-- [x] `/healthz` (cheap, always 200) and `/readyz` (DB ping). frps liveness check deferred to post-MVP — current implementation only pings the database.
-- [x] Structured request logs (trace ID, route, status, latency, token_id).
+- [x] Generate DNS-safe `t-` IDs with 80 random bits and collision retries.
+- [x] `POST /v1/tunnels` with HTTP-only type, local endpoint validation, TTL,
+  runtime credential, and frpc configuration.
+- [x] Default omitted/zero TTL to the lower of one hour and
+  `HATCHWAY_MAX_TTL`; require the configured maximum to be at least one
+  second.
+- [x] Enforce a per-user quota over `reserved`, `active`, and `closed` rows
+  under a transaction-scoped PostgreSQL advisory lock.
+- [x] Owner-scoped keyset pagination for `GET /v1/tunnels`; return all owned
+  states rather than only active tunnels.
+- [x] Owner-scoped `GET /v1/tunnels/{id}`.
+- [x] Treat `DELETE /v1/tunnels/{id}` as idempotent revocation, not row
+  deletion.
+- [x] Admin-only cross-owner revoke.
+- [x] Implement `reserved → active → closed → active`, with terminal
+  `expired` and `revoked` transitions.
+- [x] Record lifecycle events and expire elapsed rows in the reaper.
 
-## Phase 4 — Tunnel CRUD API + lifecycle
+## Phase 5 — frps plugin authorization
 
-**Goal:** the four tunnel endpoints from `DESIGN.md` § API Design work, the lifecycle state machine is enforced, and a reaper expires tunnels past their TTL.
+**Goal:** keep tunnel ownership in Hatchway while frp owns traffic transport.
 
-**Exit criteria:** integration test creates → lists → gets → deletes a tunnel; an expired tunnel transitions to `expired` within one reaper interval; concurrent-tunnel and create-rate quotas reject excess requests with the right error code.
+- [x] Protect `/frp/plugin/{secret}` with constant-time path-secret comparison
+  on the internal listener.
+- [x] Enforce configurable per-callback deadlines and body limits.
+- [x] Validate runtime token expiry/revocation on `Login`.
+- [x] On `NewProxy`, bind proxy name, HTTP type, and subdomain to the issued
+  tunnel and reject custom domains.
+- [x] Transition accepted registrations and clean disconnects.
+- [x] Apply an active-state and database-clock TTL check whenever frp emits
+  `NewUserConn`; optionally persist accepted callback events.
+- [x] Gate every wildcard HTTP request through Hatchway in the bundled Caddy
+  topology because frp does not emit `NewUserConn` for HTTP proxies.
+- [x] Allow already admitted requests and upgraded connections to drain.
+- [x] Accept `Ping` and `NewWorkConn` unchanged.
 
-- [x] Tunnel ID generator: 16 chars from the Crockford-style alphabet `abcdefghjkmnpqrstuvwxyz23456789`, prefixed `t-`. Use `crypto/rand`. Add a uniqueness retry loop against the DB (collisions ~impossible at 80 bits but the loop is cheap).
-- [x] Runtime token generator: reuse `internal/tokens`.
-- [x] `POST /v1/tunnels`: validate body, check concurrent-tunnel quota, mint tunnel_id + runtime token, insert `tunnels` row in `reserved`, insert `tunnel_runtime_tokens` row, return the response shape from DESIGN.md including `frp.server_token` (bootstrap secret).
-- [x] `GET /v1/tunnels` (paginated; `limit` default 50, max 100; `cursor` for next page). Owner scope only.
-- [x] `GET /v1/tunnels/{id}`. 404 if not owned by the caller (do not leak existence).
-- [x] `DELETE /v1/tunnels/{id}`: transition to `revoked`, revoke runtime token, mark for closure (the actual frps disconnect happens via plugin or out-of-band).
-- [x] State machine: enforce the transition table from `DESIGN.md` § Tunnel Lifecycle. A single `internal/server/tunnels` function `Transition(ctx, id, event)` is the only place that writes `tunnels.status`.
-- [x] Reaper: background goroutine. Every 30s: `UPDATE tunnels SET status='expired' WHERE expires_at < now() AND status IN ('reserved','active','closed')`. Emit `tunnel_events`.
-- [x] Quota enforcement: `HATCHWAY_MAX_CONCURRENT_TUNNELS` (default 5) on create.
-- [x] TTL cap: `HATCHWAY_MAX_TTL` (default 24h) on create.
-- [x] Validate `local_host` is `127.0.0.1` or `localhost` (no opt-out in MVP).
+## Phase 6 — Native client CLI
 
-## Phase 5 — frps plugin endpoint
+**Goal:** one foreground command creates, runs, and tears down a tunnel.
 
-**Goal:** frps callbacks land on `:9001` and authorize tunnels exactly per `DESIGN.md` § frps Plugin Authorization.
+- [x] Store credentials atomically with restrictive permissions and reject
+  symlink/loose-permission files.
+- [x] Validate and normalize the API origin.
+- [x] Let environment credentials override the file.
+- [x] `auth set-token`, `auth whoami [--json]`, and `auth logout`.
+- [x] `http <port> [--ttl] [--json]` with a local-port preflight and a fresh
+  idempotency key.
+- [x] Let the server choose its capped default TTL when `--ttl` is absent.
+- [x] Generate/validate a mode-`0600` frpc config.
+- [x] Find frpc beside `hatchway`, then on `PATH`.
+- [x] Restart an unexpectedly failed frpc up to three times.
+- [x] Revoke the reservation after signals, normal exit, startup/configuration
+  failures, or exhausted restarts.
+- [x] Retry safe and explicitly idempotent HTTP requests on transport failure
+  and 502/503/504.
+- [x] `list [--json]` follows pagination and returns all owned states.
+- [x] `delete` reports revocation.
+- [x] Leave `tcp`/`udp` as explicit unsupported placeholders.
 
-**Exit criteria:** with a real frps configured against the plugin, an frpc that presents a valid runtime token logs in and registers; an frpc with no/invalid token is rejected at `Login`; a token whose tunnel was deleted is rejected; a `NewProxy` whose subdomain doesn't match the tunnel ID is rejected.
-
-- [x] `/frp/plugin` handler dispatches by `op` field. Decode payloads per frp's plugin protocol (see frp docs; pin a frp version in go.mod or in a constants file). Require `X-Hatchway-Plugin-Secret` header matching `HATCHWAY_PLUGIN_SECRET` — reject all other requests.
-- [x] `Login`: read `metadatas.runtime_token`, look up by prefix, verify hash, check `expires_at > now()` and `revoked_at IS NULL`. On success, bump `last_used_at` and `use_count`. Return `Reject` with a generic message on failure (don't enumerate why).
-- [x] `NewProxy`: validate `proxy_name == tunnel_id`, `subdomain == tunnel_id` for HTTP, owner matches the runtime token's tunnel, `proxy_type` allowed (HTTP only in MVP), tunnel not in `expired` or `revoked`. Transition `reserved → active` (or `closed → active` on reconnect).
-- [x] `CloseProxy`: transition to `closed` if currently `active`. Do not transition out of terminal states.
-- [x] `NewUserConn` (optional, behind `HATCHWAY_LOG_USER_CONNS`): write a `tunnel_events` row. Off by default to avoid table bloat.
-- [x] All plugin handlers must complete within 1s (frp will time out otherwise). Add a request deadline.
-- [x] Defense-in-depth: `HATCHWAY_PLUGIN_SECRET` is required (not optional). frps passes it as a plugin header; the handler rejects requests without it. This is documented in DESIGN.md.
-
-## Phase 6 — Client CLI
-
-**Goal:** `hatchway http <port>` works end-to-end against a running server.
-
-**Exit criteria:** `hatchway http 3000 --ttl 15m` prints a working public URL. Ctrl-C cleans up. `--json` produces machine-readable output. Token storage respects 0600 mode.
-
-- [x] `hatchway auth set-token --server <url> <token>`: write `${XDG_CONFIG_HOME:-$HOME/.config}/hatchway/credentials.json` mode 0600, parent 0700. Refuse to overwrite a file with looser permissions without confirmation. Store both the token and server URL. Error if no server is configured (via `--server`, `HATCHWAY_SERVER` env, or existing `credentials.json`).
-- [x] `hatchway auth whoami`: call `/v1/me` (add this endpoint in Phase 4 if not already).
-- [x] `hatchway auth logout`: delete the credential file.
-- [x] `HATCHWAY_TOKEN` and `HATCHWAY_SERVER` env overrides (take precedence over file).
-- [x] HTTP client: typed wrappers around the four tunnel endpoints with timeouts and retry on idempotent operations.
-- [x] `--ttl` parser accepting `5m`, `15m`, `30m`, `1h`, `24h` (use `time.ParseDuration` after lowercasing).
-- [x] `hatchway http <port> [--ttl] [--json]`:
-  - [x] Pre-flight: `net.Dial` to `127.0.0.1:<port>` to surface `LOCAL_PORT_NOT_REACHABLE` early.
-  - [x] Generate idempotency key.
-  - [x] Call `POST /v1/tunnels`.
-  - [x] Generate `frpc.toml` in a temp dir; mode 0600.
-  - [x] Spawn `frpc` as a subprocess; pipe stderr to our logger at debug level.
-  - [x] Print the public URL to stdout (or JSON if `--json`).
-  - [x] On SIGINT/SIGTERM: kill frpc, call `DELETE /v1/tunnels/{id}` (best-effort, short timeout), exit 0.
-  - [x] If frpc exits unexpectedly: log, attempt one restart with backoff, then surface error and clean up.
-- [x] `hatchway list` / `hatchway delete <id>` (table + `--json`). `hatchway status <id>` deferred to post-MVP — `hatchway list` shows all tunnels.
-- [x] `hatchway tcp <port>` / `hatchway udp <port>` — stubbed in Phase 6 with a clear "not yet supported" error; implement in a post-MVP phase.
+Structured CLI error output remains a future improvement; `--json` currently
+covers selected success paths only.
 
 ## Phase 7 — frp packaging
 
-**Goal:** the right frpc/frps binaries ship with the right artifacts.
+**Goal:** pin and verify the frp data-plane binary.
 
-**Exit criteria:** `dist/hatchway-<os>-<arch>.tar.gz` (client) contains `hatchway` and `frpc` and runs without further downloads. The server Docker image contains `frps` and `hatchway`.
+- [x] Pin frp v0.69.0.
+- [x] Verify downloaded client and server archives by SHA-256.
+- [x] Build a dedicated non-root frps image.
+- [x] Configure GoReleaser client archives with sibling `hatchway` and `frpc`
+  files and separate server archives.
+- [ ] Publish and verify the first tagged release artifacts.
 
-- [x] Pin frp version. Document the exact version (e.g. `v0.58.x`). → **v0.68.1**
-- [x] Build script that downloads the official frp release for each target triple, verifies checksums, and stages it next to the `hatchway` binary.
-- [x] Goreleaser config that emits client tarballs for darwin/linux × amd64/arm64 with the bundled `frpc`.
-- [x] Subprocess wrapper (`internal/frp/process.go`): start, stop, wait, log capture, restart-with-backoff. Used by both client (frpc) and server (frps in subprocess mode).
-- [x] frps subprocess mode flag: `HATCHWAY_FRPS_MODE=subprocess|external` (default `external` for production, `subprocess` for `hatchway server run --dev`).
+## Phase 8 — Docker deployment
 
-## Phase 8 — Server Docker deployment
+**Goal:** a conservative single-host production baseline.
 
-**Goal:** `docker compose up` brings up Postgres + hatchway-server + frps + Caddy and a manually-issued admin token can create a working tunnel.
+- [x] Compose PostgreSQL, Hatchway, frps, and a Cloudflare-DNS-enabled Caddy.
+- [x] Require Caddy authorization before proxying wildcard HTTP traffic to
+  frps.
+- [x] Render frps configuration from explicit environment variables.
+- [x] Keep the internal Hatchway listener and frps vhost port off
+  host-published ports.
+- [x] Use non-root Hatchway/frps images, read-only application containers,
+  dropped capabilities, PID limits, tmpfs scratch space, service health
+  checks, graceful stop windows, and bounded JSON log rotation where
+  applicable.
+- [x] Isolate PostgreSQL on a backend network joined only by Hatchway.
+- [x] Derive optional service domains from `HATCHWAY_DOMAIN`.
+- [x] Pass server limit, timeout, logging, and retention settings through
+  Compose.
 
-**Exit criteria:** a fresh VPS with only Docker installed can clone the repo, set three env vars, run `docker compose up -d`, and have a working tunnel terminate at `https://<id>.tunnel.example.com`.
+## Phase 9 — Operations and retention
 
-- [x] `Dockerfile` for `hatchway:latest` (multi-stage; final stage `gcr.io/distroless/static-debian12` or `alpine`). Include a `USER nonroot` directive — do not run the service as root inside the container.
-- [x] `Dockerfile` for `hatchway-frps:latest` if separate-container mode (or document reuse of upstream `snowdreamtech/frps`).
-- [x] Custom Caddy `Dockerfile` built with `xcaddy` and the chosen DNS provider plugin (default example: Cloudflare).
-- [x] `docker-compose.yml` matching `DESIGN.md` § Docker Strategy. Verify the plugin port (`:9001`) is **not** in any `ports:` section.
-- [x] `Caddyfile` matching DESIGN.md.
-- [x] `frps.toml` template with bootstrap secret pulled from env at container start.
-- [x] `.env.example` listing every `HATCHWAY_*` env var with sensible defaults and brief comments.
-- [x] Smoke test script: `scripts/smoke.sh` runs the full create-tunnel + curl-public-URL flow against a local compose stack.
+**Goal:** predictable expiry, cleanup, and minimum viable visibility.
 
-## Phase 9 — Reaper, retention, ops
+- [x] Run the expiry reaper every 30 seconds.
+- [x] Run event, idempotency, and dead-runtime-token retention hourly.
+- [x] Expose plugin operation, plugin deadline, rate rejection, lifecycle,
+  tunnel-state, and DB-pool metrics on the internal listener.
+- [x] Gracefully drain both HTTP listeners for up to 30 seconds.
+- [x] Stop background jobs and subprocess frps from the same cancellation
+  context.
 
-**Goal:** the system stays healthy unattended.
+## Phase 10 — Verification
 
-**Exit criteria:** after a 24h soak run, no table grows unboundedly, no goroutines leak, expired tunnels are reclaimed promptly.
+**Goal:** cover security and concurrency boundaries.
 
-- [x] Tunnel reaper (covered in Phase 4) — verify it runs on the server-side schedule.
-- [x] `tunnel_events` retention sweeper: every hour, delete rows older than 30 days (`HATCHWAY_EVENTS_RETENTION_DAYS`).
-- [x] `idempotency_keys` sweeper: every hour, delete rows older than 24h.
-- [x] Admin kill switch: `POST /v1/admin/tunnels/{id}/revoke` (admin-only). Wire it to the same `Transition` path as user-initiated delete.
-- [x] Metrics endpoint (`/metrics`, Prometheus format) at minimum: tunnels by status, plugin op counts/latency, rate-limit rejections, DB pool stats. Listen on the plugin port (internal) so it isn't public.
-- [x] Graceful shutdown: drain HTTP, stop reapers, close DB, kill subprocesses, all within 30s.
+- [x] Unit tests for token mint/verify/legacy compatibility.
+- [x] Unit tests for tunnel IDs/lifecycle transitions and fuzz coverage for
+  the opaque pagination cursor parser.
+- [x] API tests for auth, roles, body limits, JSON errors, pagination,
+  idempotency, and replay encryption.
+- [x] PostgreSQL integration tests for quota races, lifecycle/reaper/sweepers,
+  and plugin callbacks.
+- [x] CLI tests for credential safety, retries, cleanup, frpc lookup/config,
+  and health checks.
+- [x] Docker/Compose configuration validation in CI.
 
-## Phase 10 — Tests
+## Phase 11 — Documentation and release
 
-**Goal:** a green CI run gives reasonable confidence the system works.
+- [x] Reconcile README, design, CLI, API, self-hosting, extension, deployment,
+  and source-reading docs with the implementation.
+- [x] Remove time-sensitive competitor comparison claims.
+- [x] Mark future APIs and protocols explicitly.
+- [ ] Create a release tag and publish checksummed client/server archives.
+- [ ] Perform a clean-host installation test from the published artifacts.
 
-**Exit criteria:** unit, integration, and one end-to-end smoke test all run in CI. Coverage on the security-critical paths (token verify, plugin authorization, state machine) is high.
+## Post-MVP backlog
 
-- [x] Unit tests: token mint/verify, ID generator (alphabet, length, prefix, no confusables), state machine transitions (table-driven), TTL parser, idempotency hash.
-- [x] Integration tests against real Postgres (testcontainers): all four CRUD endpoints, idempotency replay, rate-limit reject, quota reject, reaper run.
-- [x] Plugin authorization tests: every Reject branch in DESIGN.md § frps Plugin Authorization is covered by a test that proves it rejects.
-- [x] End-to-end smoke (CI job): boot the compose stack, create a tunnel against a local origin, curl the public URL, verify the response, tear down.
-- [x] Fuzz target on the tunnel-ID parser/regex.
+These are intentionally **not implemented**:
 
-## Phase 11 — Docs & release
+- TCP and UDP tunnel allocation, routing, and abuse controls
+- custom domains
+- per-tunnel HTTP authentication, allowlists, visit caps, and bandwidth caps
+- distributed rate limiting for multi-replica deployments
+- forced termination of already accepted user connections
+- public admin APIs for user/token lifecycle or cross-user inventory
+- event webhooks/streams and audit export
+- OAuth/SSO/MFA and a web dashboard
+- organizations/teams and billing
+- separate agent-skill packages
+- alternate DNS provider examples and origin-lockdown guidance
 
-**Goal:** a stranger can self-host Hatchway from the README in under an hour.
+## Recorded design decisions
 
-**Exit criteria:** README quickstart works on a clean machine; `goreleaser release --snapshot` produces all artifacts.
-
-- [x] `README.md`: 60-second pitch, quickstart, link to DESIGN.md and self-host guide.
-- [x] `docs/self-host.md`: VPS prep, DNS records, env vars, first-token bootstrap, common pitfalls (cert renewal, port range warnings).
-- [x] `docs/api.md`: endpoint reference generated or hand-written from the chi router.
-- [x] `docs/cli.md`: every subcommand with example output.
-- [x] Goreleaser config validated end-to-end.
-- [x] License file (MIT or Apache-2.0).
-- [ ] Tag `v0.1.0`, push, verify the release artifacts attach.
-
-## Post-MVP backlog (do not start until all phases above are checked)
-
-- [ ] TCP and UDP tunnel types (revisit the iptables port-range tradeoff first).
-- [ ] OAuth login / web dashboard.
-- [ ] Per-tunnel basic auth or IP allowlist.
-- [ ] Max-visits-per-tunnel.
-- [ ] Custom domains.
-- [ ] Per-tunnel bandwidth and connection caps.
-- [ ] `hatchway-skills` repo for AI-agent skills.
-- [ ] Multi-replica server (move idempotency cache and rate limiter out of process memory).
-- [ ] Audit log retention beyond `tunnel_events`.
-- [ ] `/readyz` frps liveness check (TCP dial to frps:7000; currently only checks DB).
-- [ ] `hatchway status <tunnel_id>` client command (use `hatchway list` for now).
-
-### Security hardening: hide real IP behind Cloudflare
-
-`frps.example.com` and `*.tunnel.example.com` currently use grey cloud DNS, which exposes the server's real IP. These items improve the situation.
-
-#### Origin Certificate for tunnel traffic
-
-Replace the Let's Encrypt DNS-01 wildcard cert with a Cloudflare Origin Certificate for `*.tunnel.example.com`. This allows turning on orange cloud (proxy mode) for tunnel traffic.
-
-- [ ] Generate Cloudflare Origin Certificate (15-year validity) for `*.tunnel.example.com`
-- [ ] Mount cert/key into Caddy container
-- [ ] Update Caddyfile to use the origin cert instead of DNS-01 challenge
-- [ ] Turn on orange cloud for `*.tunnel.example.com` DNS record
-- [ ] Verify tunnel traffic flows through Cloudflare (check `cf-ray` header)
-- [ ] Remove `CLOUDFLARE_API_TOKEN` from `.env` and `Dockerfile.caddy` DNS plugin build (no longer needed for tunnel domain)
-- [ ] Update docs (README, self-host.md, DESIGN.md) to reflect new setup
-- [ ] Keep `CLOUDFLARE_API_TOKEN` option available as fallback for non-Cloudflare deployments
-
-#### frps port 7000 hardening
-
-Port 7000 must remain grey cloud since Cloudflare cannot proxy raw TCP. Mitigate exposure:
-
-- [ ] Add iptables connection rate limiting (max 10 new connections/sec, burst 20)
-- [ ] Enable frps TLS transport (`transport.tls.force = true`) to encrypt control channel
-- [ ] Document optional separate data plane VM deployment (frps + Caddy on a different IP)
-- [ ] Consider Cloudflare Spectrum as an enterprise option for TCP proxying
-
-#### General hardening
-
-- [ ] Document fail2ban rules for repeated frps auth failures
-- [ ] Add `HATCHWAY_FRPS_BIND_IP` option to restrict frps to a specific interface
-- [ ] Evaluate separate VM architecture: data plane VM (frps + Caddy) vs control plane VM (API + DB)
-
-## Open questions (resolve before starting the relevant phase)
-
-- [x] Module path / GitHub owner for `go mod init` (Phase 0). → `github.com/zydo/hatchway`
-- [x] CLI library: Cobra vs urfave/cli (Phase 0). → Cobra
-- [x] Logger: zap vs zerolog (Phase 0). → slog (stdlib)
-- [x] HTTP framework: chi vs gin vs fiber (Phase 3). → chi
-- [x] Token hash: argon2id vs bcrypt (Phase 2). → argon2id
-- [x] frp version pin (Phase 7). → v0.68.1
-- [x] Default DNS provider for the custom Caddy image (Phase 8). → Cloudflare (xcaddy plugin)
-- [x] License (Phase 11). → MIT
+- **Data plane:** frp, used as standalone binaries rather than a Go library.
+- **MVP protocol:** HTTP only.
+- **Database:** PostgreSQL.
+- **API authentication:** operator-minted bearer tokens; no self-signup.
+- **TLS:** Caddy wildcard certificate via DNS-01 in the bundled deployment.
+- **Production frps model:** separate container; subprocess mode is for
+  development/alternate deployments.
+- **Tunnel IDs:** server-generated and non-customizable.
+- **Revocation semantics:** retain the audit row, revoke credentials, and block
+  new connections; existing connections may drain.

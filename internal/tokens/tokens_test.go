@@ -1,9 +1,14 @@
 package tokens
 
 import (
+	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -13,6 +18,17 @@ import (
 func legacyHashForTest(raw string) string {
 	h := argon2.IDKey([]byte(raw), legacyFixedSalt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return fmt.Sprintf("%x", h)
+}
+
+func phcHashForTest(raw string) string {
+	salt := []byte("0123456789abcdef")
+	h := argon2.IDKey([]byte(raw), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version,
+		argonMemory, argonTime, argonThreads,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(h),
+	)
 }
 
 func TestMintAPIToken(t *testing.T) {
@@ -120,22 +136,35 @@ func TestVerifyToken_DifferentToken(t *testing.T) {
 	}
 }
 
-func TestHashUsesRandomSaltButVerifies(t *testing.T) {
+func TestHashIsDeterministicAndVerifies(t *testing.T) {
 	tok, _ := MintAPIToken()
 	h1 := HashToken(tok.Raw)
 	h2 := HashToken(tok.Raw)
-	if h1 == h2 {
-		t.Error("hash should be salted: two calls must not produce the same string")
+	if h1 != h2 {
+		t.Error("SHA-256 token digest should be deterministic")
 	}
-	if !VerifyToken(tok.Raw, h1) || !VerifyToken(tok.Raw, h2) {
-		t.Error("both salted hashes must verify against the original token")
+	if !VerifyToken(tok.Raw, h1) {
+		t.Error("digest must verify against the original token")
 	}
 }
 
-func TestHashFormatIsPHC(t *testing.T) {
+func TestHashFormatIsVersionedSHA256(t *testing.T) {
 	h := HashToken("sk_live_abc")
-	if !strings.HasPrefix(h, "$argon2id$") {
-		t.Errorf("expected PHC string starting with $argon2id$, got %q", h)
+	if !strings.HasPrefix(h, "sha256:") {
+		t.Errorf("expected versioned SHA-256 digest, got %q", h)
+	}
+	if !UsesCurrentHash(h) {
+		t.Error("UsesCurrentHash() should recognize newly generated digests")
+	}
+	if UsesCurrentHash("$argon2id$v=19$...") {
+		t.Error("UsesCurrentHash() should reject legacy digests")
+	}
+}
+
+func TestVerifyToken_PHCRoundTrip(t *testing.T) {
+	tok, _ := MintAPIToken()
+	if !VerifyToken(tok.Raw, phcHashForTest(tok.Raw)) {
+		t.Error("verifier should accept legacy PHC hashes")
 	}
 }
 
@@ -146,6 +175,63 @@ func TestVerifyToken_LegacyRoundTrip(t *testing.T) {
 	legacy := legacyHashForTest(tok.Raw)
 	if !VerifyToken(tok.Raw, legacy) {
 		t.Error("verifier should accept legacy fixed-salt hex hashes")
+	}
+}
+
+func TestVerifyToken_LegacyWorkIsConcurrencyBounded(t *testing.T) {
+	tok, _ := MintAPIToken()
+	legacy := legacyHashForTest(tok.Raw)
+	for range cap(legacyVerifySlots) {
+		legacyVerifySlots <- struct{}{}
+	}
+	defer func() {
+		for range cap(legacyVerifySlots) {
+			<-legacyVerifySlots
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	matches, err := VerifyTokenContext(ctx, tok.Raw, legacy)
+	if matches {
+		t.Fatal("legacy verification should not bypass the concurrency bound")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("VerifyTokenContext() error = %v, want context deadline", err)
+	}
+}
+
+func TestLegacyVerificationReturnsOnCancellationWhileWorkerFinishes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	matches, err := withLegacyVerifySlot(ctx, func() bool {
+		close(started)
+		<-release
+		return true
+	})
+	<-started
+	if matches {
+		t.Fatal("canceled verification should not report a match")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("withLegacyVerifySlot() error = %v, want context deadline", err)
+	}
+	if len(legacyVerifySlots) != 1 {
+		t.Fatalf("worker released its slot before the non-cancelable work finished")
+	}
+
+	close(release)
+	deadline := time.After(time.Second)
+	for len(legacyVerifySlots) != 0 {
+		select {
+		case <-deadline:
+			t.Fatal("legacy verification worker did not release its slot")
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -173,6 +259,9 @@ func TestKindOf(t *testing.T) {
 	if KindOf("rt_xxx") != KindRuntime {
 		t.Error("rt_ should be KindRuntime")
 	}
+	if KindOf("not-a-token") != KindUnknown {
+		t.Error("unrecognized prefix should be KindUnknown")
+	}
 }
 
 func TestParsePHC_Malformed(t *testing.T) {
@@ -183,10 +272,15 @@ func TestParsePHC_Malformed(t *testing.T) {
 		{"empty", ""},
 		{"missing prefix", "not a phc"},
 		{"wrong algo", "$argon2i$v=19$m=65536,t=3,p=4$YWJjZGVm$YWJjZGVm"},
+		{"wrong version", "$argon2id$v=16$m=65536,t=3,p=4$MDEyMzQ1Njc4OWFiY2RlZg$YWJjZGVm"},
 		{"too few fields", "$argon2id$v=19$m=65536,t=3,p=4$abc"},
 		{"bad params", "$argon2id$v=19$m=bad,t=bad,p=bad$YWJjZGVm$YWJjZGVm"},
+		{"zero params", "$argon2id$v=19$m=0,t=0,p=0$MDEyMzQ1Njc4OWFiY2RlZg$YWJjZGVm"},
+		{"huge memory", "$argon2id$v=19$m=4294967295,t=3,p=4$MDEyMzQ1Njc4OWFiY2RlZg$YWJjZGVm"},
 		{"bad salt b64", "$argon2id$v=19$m=65536,t=3,p=4$@@@@@@$YWJjZGVm"},
+		{"short salt", "$argon2id$v=19$m=65536,t=3,p=4$YWJj$YWJjZGVm"},
 		{"bad hash b64", "$argon2id$v=19$m=65536,t=3,p=4$YWJjZGVm$@@@@@@"},
+		{"empty hash", "$argon2id$v=19$m=65536,t=3,p=4$MDEyMzQ1Njc4OWFiY2RlZg$"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,7 +301,7 @@ func TestParsePHC_DirectErrors(t *testing.T) {
 	if err == nil {
 		t.Error("non-numeric params should error")
 	}
-	_, _, _, _, _, err = parsePHC("$argon2id$v=19$m=1,t=1,p=1$!!!$YWJj")
+	_, _, _, _, _, err = parsePHC("$argon2id$v=19$m=65536,t=3,p=4$!!!$YWJj")
 	if err == nil {
 		t.Error("malformed salt should error")
 	}

@@ -227,7 +227,7 @@ func TestCloseProxyRejectsInvalidContent(t *testing.T) {
 
 // NewUserConn tests
 
-func TestNewUserConnAllowedWhenDisabled(t *testing.T) {
+func TestNewUserConnFailsClosedWithoutStorage(t *testing.T) {
 	cfg := newConfig("s3cret")
 	cfg.LogUserConns = false
 	resp := postPlugin(cfg, nil, "NewUserConn", map[string]any{
@@ -237,11 +237,8 @@ func TestNewUserConnAllowedWhenDisabled(t *testing.T) {
 			"remote_addr": "1.2.3.4:5678",
 		},
 	})
-	if resp.Reject {
-		t.Error("NewUserConn should not reject when disabled")
-	}
-	if !resp.Unchange {
-		t.Error("NewUserConn should return unchange")
+	if !resp.Reject {
+		t.Error("NewUserConn should reject when tunnel state cannot be checked")
 	}
 }
 

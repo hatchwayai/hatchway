@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	cli "github.com/zydo/hatchway/internal/cli"
 )
 
@@ -31,7 +33,10 @@ func TestGenerateFRPCConfig(t *testing.T) {
 		},
 	}
 
-	config := generateFRPCConfig(tunnel, "127.0.0.1", 3000)
+	config, err := generateFRPCConfig(tunnel, "127.0.0.1", 3000)
+	if err != nil {
+		t.Fatalf("generateFRPCConfig() error = %v", err)
+	}
 
 	checks := []string{
 		`serverAddr = "frps.example.com"`,
@@ -51,7 +56,7 @@ func TestGenerateFRPCConfig(t *testing.T) {
 	}
 }
 
-func TestGenerateFRPCConfigEmptyLocalHost(t *testing.T) {
+func TestGenerateFRPCConfigRejectsChangedLocalTarget(t *testing.T) {
 	expires := time.Now().Add(time.Hour)
 	tunnel := &cli.TunnelResponse{
 		TunnelID:     "t-test",
@@ -64,9 +69,14 @@ func TestGenerateFRPCConfigEmptyLocalHost(t *testing.T) {
 		},
 	}
 
-	config := generateFRPCConfig(tunnel, "", 8080)
-	if !strings.Contains(config, `localIP = "127.0.0.1"`) {
-		t.Error("empty localHost should default to 127.0.0.1")
+	if _, err := generateFRPCConfig(tunnel, "127.0.0.1", 3000); err == nil {
+		t.Fatal("generateFRPCConfig() should reject a server-modified local target")
+	}
+}
+
+func TestGenerateFRPCConfigRejectsIncompleteResponse(t *testing.T) {
+	if _, err := generateFRPCConfig(&cli.TunnelResponse{}, "127.0.0.1", 3000); err == nil {
+		t.Fatal("generateFRPCConfig() should reject a missing FRP block")
 	}
 }
 
@@ -146,5 +156,19 @@ func TestDeleteCmdRequiresArg(t *testing.T) {
 	cmd := deleteCmd()
 	if cmd.Args == nil {
 		t.Error("delete should require args")
+	}
+}
+
+func TestZeroArgumentClientCommandsRejectStrayArguments(t *testing.T) {
+	commands := []*cobra.Command{
+		versionCmd("test"),
+		authWhoamiCmd(),
+		authLogoutCmd(),
+		listCmd(),
+	}
+	for _, cmd := range commands {
+		if err := cmd.Args(cmd, []string{"unexpected"}); err == nil {
+			t.Errorf("%s should reject a positional argument", cmd.CommandPath())
+		}
 	}
 }

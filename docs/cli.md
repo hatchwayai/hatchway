@@ -1,335 +1,338 @@
 # CLI Reference
 
+The `hatchway` binary contains both client commands and trusted server-side
+operator commands. This page documents the current command tree.
+
 ## Installation
 
-### Pre-built binaries
-
-Download from the [GitHub releases](https://github.com/zydo/hatchway/releases) page. Client archives include the `frpc` binary.
-
-### Build from source
+This repository does not yet have a published release tag. Build the current
+client from source:
 
 ```bash
 git clone https://github.com/zydo/hatchway.git
 cd hatchway
 make build
-# Binary at dist/hatchway
 ```
 
-## Global options
+The binary is written to `dist/hatchway`. `hatchway http` also needs an
+executable `frpc` (the repository pins frp v0.69.0). Put `frpc`:
+
+1. next to the `hatchway` executable; or
+2. in a directory on `PATH`.
+
+The sibling copy takes precedence. If neither is found, tunnel creation fails
+and the server reservation is revoked during cleanup.
+
+The GoReleaser configuration is prepared to bundle side-by-side `hatchway` and
+`frpc` binaries in future client archives.
+
+## General behavior
 
 ```bash
-hatchway [command] [flags]
+hatchway --help
+hatchway <command> --help
 ```
 
-Use `hatchway --help` to see all available commands.
+Commands that support `--json` emit machine-readable **success** output to
+stdout. CLI validation and transport errors remain plain text on stderr.
+Operational logs emitted through `slog` are JSON on stderr.
 
-## Commands
+The HTTP client makes up to three attempts, with exponential backoff, for
+transport failures and HTTP 502/503/504 responses when a request is safe to
+retry: `GET`, `HEAD`, `DELETE`, or a request carrying an `Idempotency-Key`.
+A keyed request also retries a `409` that carries `Retry-After`, which marks a
+temporary in-flight reservation; permanent same-key conflicts are returned
+immediately. If a keyed create receives a truncated or malformed `201` body,
+the client replays the same request once to recover the committed response and
+one-time runtime token. Server-provided retry delays are honored up to five
+seconds.
+
+## Client commands
 
 ### `hatchway version`
 
-Print the binary version.
+Print the version embedded at build time. A direct development build commonly
+prints a Git-derived value from the Makefile; an unversioned `go build` prints
+`dev`.
+
+### `hatchway auth set-token [token]`
+
+Store an API endpoint and token:
 
 ```bash
-$ hatchway version
-0.1.0
+hatchway auth set-token \
+  --server https://api.example.com \
+  sk_live_...
 ```
 
-### `hatchway auth`
+If the token argument is omitted, the command reads it without terminal echo.
+`--server` is required unless `HATCHWAY_SERVER` is set. The URL must be an
+`http://` or `https://` origin without credentials, a path, query, or fragment.
 
-Manage client authentication.
+Credentials are stored atomically in
+`${XDG_CONFIG_HOME:-$HOME/.config}/hatchway/credentials.json`. The directory
+must not be accessible by group/other users and the file must not be a
+symlink; the file is written with mode `0600`.
 
-#### `hatchway auth set-token [token]`
+### `hatchway auth whoami`
 
-Save an API token and server URL for client commands.
+Validate the resolved credentials:
 
-```bash
-$ hatchway auth set-token --server https://api.example.com sk_live_abc123...
-Token saved.
-```
-
-If the token argument is omitted, you are prompted to paste it.
-
-The token is stored in `${XDG_CONFIG_HOME:-$HOME/.config}/hatchway/credentials.json` with mode `0600`.
-
-Environment variable overrides: `HATCHWAY_TOKEN` and `HATCHWAY_SERVER` take precedence over the saved credentials.
-
-#### `hatchway auth whoami`
-
-Verify the saved token against the server.
-
-```bash
+```console
 $ hatchway auth whoami
 Authenticated as 550e8400-e29b-41d4-a716-446655440000 on https://api.example.com
 ```
 
-With JSON output:
-
-```bash
+```console
 $ hatchway auth whoami --json
-{"user_id":"550e8400-e29b-41d4-a716-446655440000","server":"https://api.example.com"}
+{"server":"https://api.example.com","user_id":"550e8400-e29b-41d4-a716-446655440000"}
 ```
 
-#### `hatchway auth logout`
+The API also returns `is_admin`, but the current CLI output intentionally
+contains only `user_id` and `server`.
 
-Remove the saved token.
+### `hatchway auth logout`
 
-```bash
-$ hatchway auth logout
-Token removed.
-```
+Remove the stored credentials file. Environment variables, if set, are not
+changed.
 
 ### `hatchway http <port>`
 
-Create an HTTP tunnel forwarding traffic from a public URL to a local port.
+Create and run an HTTP tunnel from a public URL to `127.0.0.1:<port>`:
 
-```bash
-$ hatchway http 3000
-Tunnel created: https://t-abc3x7km9w2p4rng.tunnel.example.com
+```console
+$ hatchway http 3000 --ttl 15m
+https://t-abc3x7km9w2p4rng.tunnel.example.com
 ```
 
-**Arguments**:
+| Input | Default | Contract |
+| --- | --- | --- |
+| `<port>` | — | Required integer from 1 through 65535 |
+| `--ttl` | server default | Positive Go duration, at least one whole second; when omitted the server chooses the lower of one hour and its configured maximum |
+| `--json` | `false` | Emit the initial tunnel result as JSON |
 
-| Arg    | Required | Description                     |
-| ------ | -------- | ------------------------------- |
-| `port` | yes      | Local port to forward (1–65535) |
+Current JSON output is:
 
-**Flags**:
-
-| Flag     | Default | Description                                   |
-| -------- | ------- | --------------------------------------------- |
-| `--ttl`  | `1h`    | Tunnel time-to-live (e.g. `15m`, `1h`, `24h`) |
-| `--json` | `false` | Output tunnel info as JSON                    |
-
-The local host is fixed to `127.0.0.1` in MVP — non-localhost forwarding will
-be reintroduced together with TCP/UDP tunnels.
-
-**JSON output**:
-
-```bash
-$ hatchway http 3000 --ttl 15m --json
-{"tunnel_id":"t-abc3x7km9w2p4rng","public_url":"https://t-abc3x7km9w2p4rng.tunnel.example.com","status":"reserved"}
+```json
+{
+  "public_url": "https://t-abc3x7km9w2p4rng.tunnel.example.com",
+  "status": "reserved",
+  "tunnel_id": "t-abc3x7km9w2p4rng"
+}
 ```
 
-**Lifecycle**:
+The command:
 
-1. Pre-flight: checks that the local port is reachable.
-2. Generates a fresh `Idempotency-Key` and calls `POST /v1/tunnels` to reserve a tunnel.
-3. Generates an `frpc.toml` config in a temp directory (mode `0600`).
-4. Spawns `frpc` as a subprocess.
-5. On Ctrl-C (SIGINT/SIGTERM): kills frpc, deletes the tunnel (best-effort), exits.
+1. checks that `127.0.0.1:<port>` is reachable;
+2. creates a tunnel with a fresh UUID idempotency key;
+3. validates the returned runtime/frp configuration;
+4. writes a temporary `frpc.toml` with mode `0600`;
+5. finds `frpc` next to `hatchway`, then on `PATH`;
+6. runs `frpc -c <temporary-config>`; and
+7. revokes the tunnel with a three-second cleanup request on every exit path
+   after creation.
 
-If `frpc` is not found in `PATH`, the command prints the generated config for manual use.
-
-If `frpc` exits unexpectedly, the CLI restarts it up to 3 times with a linear backoff (2s, 4s, 6s) before giving up and tearing down the tunnel.
+SIGINT/SIGTERM cancels frpc. Unexpected frpc failures are restarted at most
+three times with 2, 4, then 6 second delays. A clean frpc exit also ends the
+command and triggers revocation.
 
 ### `hatchway list`
 
-List active tunnels.
+List **all** tunnels owned by the authenticated user, including `expired` and
+`revoked` records:
 
-```bash
+```console
 $ hatchway list
-ID                      TYPE    STATUS  URL
-t-abc3x7km9w2p4rng      http    active  https://t-abc3x7km9w2p4rng.tunnel.example.com
+ID                    TYPE  STATUS   URL
+t-abc3x7km9w2p4rng    http  active   https://t-abc3x7km9w2p4rng.tunnel.example.com
+t-old3x7km9w2p4rng    http  expired  https://t-old3x7km9w2p4rng.tunnel.example.com
 ```
 
-**Flags**:
-
-| Flag     | Default | Description    |
-| -------- | ------- | -------------- |
-| `--json` | `false` | Output as JSON |
+The CLI follows every API pagination cursor before printing, so `--json`
+returns a JSON array rather than the API's paginated envelope.
 
 ### `hatchway delete <tunnel_id>`
 
-Delete a tunnel by ID.
+Revoke an owned tunnel:
 
-```bash
+```console
 $ hatchway delete t-abc3x7km9w2p4rng
-Tunnel t-abc3x7km9w2p4rng deleted.
+Tunnel t-abc3x7km9w2p4rng revoked.
 ```
 
-### `hatchway tcp <port>`
+The database row is retained. Repeating the request for an already expired or
+revoked owned tunnel succeeds.
 
-Create a TCP tunnel. **Not yet supported** — returns an error in the current version.
+### `hatchway tcp <port>` and `hatchway udp <port>`
 
-### `hatchway udp <port>`
-
-Create a UDP tunnel. **Not yet supported** — returns an error in the current version.
+These commands are placeholders and return a “not yet supported” error.
+Hatchway currently creates HTTP tunnels only.
 
 ## Server commands
 
-These commands run on the server (typically inside the Docker container).
+Server commands read PostgreSQL directly and assume trusted operator access.
+They are not substitutes for end-user API authorization.
 
 ### `hatchway server init`
 
-Initialize the database and create the first admin user.
+Apply embedded migrations and create a bootstrap admin plus its first API
+token:
 
-```bash
-$ hatchway server init
+```console
+$ hatchway server init --admin-email admin@example.com
 Migrations applied.
-Admin user created: admin@hatchway.local
+Admin user created: admin@example.com
 API token (save this — it won't be shown again):
-sk_live_abc123def456...
+sk_live_...
 ```
 
-**Flags**:
+The token is written to stdout; progress is written to stderr.
 
-| Flag            | Default                | Description                                                       |
-| --------------- | ---------------------- | ----------------------------------------------------------------- |
-| `--force`       | —                      | Allow init when users already exist (existing tokens stay valid). |
-| `--yes`, `-y`   | `false`                | Skip the `--force` confirmation prompt (CI / scripted use).       |
-| `--admin-email` | `admin@hatchway.local` | Email for the bootstrap admin user.                               |
-| `--admin-name`  | `admin`                | Display name for the bootstrap admin user.                        |
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--admin-email` | `admin@hatchway.local` | Bootstrap admin email |
+| `--admin-name` | `admin` | Display name |
+| `--force` | `false` | Allow creation when users already exist |
+| `--yes`, `-y` | `false` | Skip the `--force` confirmation |
 
-The bootstrap admin user is created with `is_admin = true` so it can call
-`/v1/admin/...`. To grant additional admins later, see `server user create --admin`.
-
-**Required environment variables**:
-
-- `DATABASE_URL` — PostgreSQL connection string
+`--force` is additive: it does not erase users or revoke existing tokens. Use
+a new unique email when adding another admin. `DATABASE_URL` is required.
 
 ### `hatchway server run`
 
-Start the Hatchway server (API + plugin endpoints).
+Validate configuration, apply every embedded migration, verify the expected
+schema, start the reaper/sweepers, then serve:
+
+- the public API on `HATCHWAY_API_ADDR` (default `:9000`); and
+- the internal callback/request-gate/metrics listener on
+  `HATCHWAY_FRPS_PLUGIN_ADDR` (default `:9001`).
+
+SIGINT/SIGTERM cancels background work and gives both HTTP servers up to 30
+seconds to drain.
+
+`--dev` selects `HATCHWAY_FRPS_MODE=subprocess`. In subprocess mode,
+`HATCHWAY_FRPS_CONFIG_PATH` is required and `HATCHWAY_FRPS_BIN_PATH` defaults
+to `frps`. If that frps process exits unexpectedly, the server stops instead
+of silently continuing without a data plane. The default production mode is
+`external`, used by Docker Compose.
+
+### `hatchway server healthcheck`
+
+Probe server readiness for container schedulers or scripts:
 
 ```bash
-$ hatchway server run
+hatchway server healthcheck
+hatchway server healthcheck --url http://127.0.0.1:9000/readyz --timeout 3s
 ```
 
-Starts two HTTP listeners:
-- API server on `$HATCHWAY_API_ADDR` (default `:9000`)
-- Plugin server on `$HATCHWAY_FRPS_PLUGIN_ADDR` (default `:9001`)
-
-Graceful shutdown on SIGINT/SIGTERM with a 30-second drain deadline.
-
-**Flags**:
-
-| Flag    | Default | Description                                                          |
-| ------- | ------- | --------------------------------------------------------------------- |
-| `--dev` | `false` | Run frps as a subprocess instead of expecting an external instance.   |
+The default URL is `http://127.0.0.1:9000/readyz` and the default timeout is
+five seconds. The command requires a direct HTTP `200`, does not follow
+redirects, drains/closes the bounded response, and returns concise errors that
+do not echo URL credentials, query values, response bodies, or transport
+details.
 
 ### `hatchway server user create`
 
-Create a new user.
-
 ```bash
-$ hatchway server user create --email alice@example.com --name Alice
-User created (user): alice@example.com (550e8400-...)
+hatchway server user create \
+  --email alice@example.com \
+  --name Alice \
+  [--admin]
 ```
 
-**Flags**:
-
-| Flag      | Required | Description                          |
-| --------- | -------- | ------------------------------------ |
-| `--email` | yes      | User email address                   |
-| `--name`  | no       | Display name                         |
-| `--admin` | no       | Grant admin privileges (`is_admin`). |
+`--email` is required. The command prints the new user UUID.
 
 ### `hatchway server user list`
 
-List all users.
-
-```bash
-$ hatchway server user list
-ID        EMAIL               NAME   ADMIN  CREATED
-550e8400  admin@example.com   Admin  true   2026-05-14
-```
-
-**Flags**:
-
-| Flag     | Default | Description    |
-| -------- | ------- | -------------- |
-| `--json` | `false` | Output as JSON |
+List every user. Add `--json` for a JSON array.
 
 ### `hatchway server token create`
 
-Create an API token for a user.
-
-```bash
-$ hatchway server token create --user alice@example.com --name "laptop"
-Token created. Save this — it won't be shown again:
-sk_live_xyz789...
+```console
+$ hatchway server token create --user alice@example.com --name laptop
+Token created (d177c478-a89a-4a38-a2b0-b996029f92db). Save the value below — it won't be shown again:
+sk_live_...
 ```
 
-**Flags**:
+`--user` accepts a user UUID, email, or unique name. An ambiguous selector is
+rejected; a UUID or unique email is safest. `--name` is required. Save both
+the printed token ID and the one-time plaintext token.
 
-| Flag     | Required | Description                       |
-| -------- | -------- | --------------------------------- |
-| `--user` | yes      | User email or name                |
-| `--name` | yes      | Token label (e.g. "laptop", "ci") |
+### `hatchway server token list`
 
-The token is printed exactly once. Store it securely.
+List token IDs and non-secret metadata:
+
+```bash
+hatchway server token list
+hatchway server token list --user alice@example.com
+hatchway server token list --json
+```
+
+`--user` filters by UUID or email. Plain output includes full token ID, user,
+label, lookup prefix, revoked state, and creation time. Neither output reveals
+the token body or digest.
 
 ### `hatchway server token revoke <token_id>`
 
-Revoke an API token by its ID.
-
-```bash
-$ hatchway server token revoke abc-123-def
-Token abc-123-def revoked.
-```
+Set `revoked_at` for one live API token. Use `server token list` to discover
+the full token ID. A missing or already revoked ID returns an error.
 
 ### `hatchway server tunnels`
 
-List all tunnels across all users (admin view).
-
-```bash
-$ hatchway server tunnels
-```
-
-**Flags**:
-
-| Flag     | Default | Description    |
-| -------- | ------- | -------------- |
-| `--json` | `false` | Output as JSON |
+List tunnels across every user, including terminal rows. This is a direct
+database operator view and does not require an API admin token. Add `--json`
+for a JSON array.
 
 ## Environment variables
 
+Invalid integers, booleans, or Go duration strings fail configuration loading
+instead of silently falling back.
+
 ### Client
 
-| Variable          | Description                              |
-| ----------------- | ---------------------------------------- |
-| `HATCHWAY_TOKEN`  | API token (overrides saved credentials)  |
-| `HATCHWAY_SERVER` | Server URL (overrides saved credentials) |
+| Variable | Meaning |
+| --- | --- |
+| `HATCHWAY_SERVER` | API origin; overrides the saved value |
+| `HATCHWAY_TOKEN` | API token; overrides the saved value |
+| `XDG_CONFIG_HOME` | Optional base directory for `hatchway/credentials.json` |
 
-### Server
+### Server binary
 
-These are read directly by the `hatchway` binary (`internal/config/config.go`).
-`HATCHWAY_FRPS_DOMAIN` is required because it's baked into the `serverAddr`
-returned to every `frpc` client in the tunnel-creation response — without it,
-tunnels are created but clients can't connect.
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | yes | — | PostgreSQL connection URL |
+| `HATCHWAY_PLUGIN_SECRET` | for `server run` | — | Internal callback/gate path secret and idempotency-cache key material |
+| `HATCHWAY_FRPS_AUTH_TOKEN` | for `server run` | — | Shared frps↔frpc bootstrap credential |
+| `HATCHWAY_FRPS_DOMAIN` | for `server run` | — | Public frps hostname returned to clients |
+| `HATCHWAY_TUNNEL_DOMAIN` | no | `tunnel.example.com` | Wildcard tunnel domain |
+| `HATCHWAY_API_ADDR` | no | `:9000` | API listen address |
+| `HATCHWAY_FRPS_PLUGIN_ADDR` | no | `:9001` | Internal callback/gate/metrics listen address |
+| `HATCHWAY_MAX_CONCURRENT_TUNNELS` | no | `5` | Non-terminal tunnels per user |
+| `HATCHWAY_MAX_TTL` | no | `24h` | Maximum tunnel TTL; must be at least one second |
+| `HATCHWAY_RATE_CREATE_PER_MIN` | no | `10` | Create rate per API token and process |
+| `HATCHWAY_MAX_REQUEST_BYTES` | no | `65536` | Body limit for `/v1` and plugin callbacks |
+| `HATCHWAY_API_READ_TIMEOUT` | no | `30s` | API read timeout |
+| `HATCHWAY_API_WRITE_TIMEOUT` | no | `30s` | API write timeout |
+| `HATCHWAY_PLUGIN_TIMEOUT` | no | `2s` | Per-callback/request-gate deadline |
+| `HATCHWAY_LOG_USER_CONNS` | no | `false` | Persist accepted `NewUserConn` audit events |
+| `HATCHWAY_FRPS_MODE` | no | `external` | `external` or `subprocess` |
+| `HATCHWAY_FRPS_BIN_PATH` | subprocess | `frps` | frps executable |
+| `HATCHWAY_FRPS_CONFIG_PATH` | subprocess | — | frps TOML path |
+| `HATCHWAY_EVENTS_RETENTION_DAYS` | no | `30` | Event retention |
+| `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` | no | `24` | Idempotency replay retention |
+| `HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS` | no | `7` | Retention after a runtime token is dead |
 
-| Variable                               | Required | Default    | Description                                          |
-| --------------------------------------- | -------- | ---------- | ----------------------------------------------------- |
-| `DATABASE_URL`                         | yes      | —          | PostgreSQL connection string                           |
-| `HATCHWAY_PLUGIN_SECRET`               | yes      | —          | frps→server plugin auth header (internal)              |
-| `HATCHWAY_FRPS_AUTH_TOKEN`             | yes      | —          | frps↔frpc bootstrap secret (returned to users)         |
-| `HATCHWAY_FRPS_DOMAIN`                 | yes      | —          | Hostname `frpc` connects to (frps's public address)    |
-| `HATCHWAY_TUNNEL_DOMAIN`               | no       | `tunnel.example.com` | Tunnel wildcard subdomain                    |
-| `HATCHWAY_API_ADDR`                    | no       | `:9000`    | API server listen address                              |
-| `HATCHWAY_FRPS_PLUGIN_ADDR`            | no       | `:9001`    | Plugin server listen address                           |
-| `HATCHWAY_MAX_CONCURRENT_TUNNELS`      | no       | `5`        | Max concurrent tunnels per user                        |
-| `HATCHWAY_MAX_TTL`                     | no       | `24h`      | Maximum tunnel TTL                                     |
-| `HATCHWAY_RATE_CREATE_PER_MIN`         | no       | `10`       | Tunnel creation rate limit per token                   |
-| `HATCHWAY_MAX_REQUEST_BYTES`           | no       | `65536`    | Max request body size in bytes (`/v1/*`)               |
-| `HATCHWAY_API_READ_TIMEOUT`            | no       | `30s`      | API server read timeout                                |
-| `HATCHWAY_API_WRITE_TIMEOUT`           | no       | `30s`      | API server write timeout                               |
-| `HATCHWAY_LOG_USER_CONNS`              | no       | `false`    | Log individual user connections                        |
-| `HATCHWAY_FRPS_MODE`                   | no       | `external` | frps mode: `external` or `subprocess`                  |
-| `HATCHWAY_FRPS_BIN_PATH`               | no       | `frps`     | Path to frps binary (subprocess mode)                  |
-| `HATCHWAY_FRPS_CONFIG_PATH`            | if `HATCHWAY_FRPS_MODE=subprocess` | — | Path to frps config file (subprocess mode) |
-| `HATCHWAY_EVENTS_RETENTION_DAYS`       | no       | `30`       | Tunnel events retention in days                        |
-| `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS` | no       | `24`       | Idempotency key retention in hours                     |
-| `HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS`| no       | `7`        | Days dead (revoked/expired) runtime tokens are kept    |
-| `HATCHWAY_PLUGIN_TIMEOUT`              | no       | `2s`       | Per-call deadline for frps plugin handlers             |
+### Docker Compose and Caddy
 
-### Docker Compose / Caddy only
+These values are consumed by Compose/Caddy rather than by the bare binary:
 
-These are consumed by `docker-compose.yml`'s own shell interpolation and by
-the bundled Caddy reverse proxy — not read by the `hatchway` binary itself.
-If you run the bare binary outside Compose, set `HATCHWAY_FRPS_DOMAIN` and
-`HATCHWAY_TUNNEL_DOMAIN` (above) directly instead.
-
-| Variable              | Required      | Default                 | Description                                        |
-| ---------------------- | -------------- | ------------------------ | --------------------------------------------------- |
-| `HATCHWAY_DOMAIN`      | yes (Compose)  | —                        | Top-level domain; other domain vars derive from it   |
-| `HATCHWAY_API_DOMAIN`  | no             | `api.$HATCHWAY_DOMAIN`   | Public hostname Caddy proxies to the API server      |
+| Variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `HATCHWAY_DOMAIN` | yes | — | Base domain used to derive service domains |
+| `HATCHWAY_API_DOMAIN` | no | `api.${HATCHWAY_DOMAIN}` | API hostname |
+| `HATCHWAY_FRPS_DOMAIN` | no | `frps.${HATCHWAY_DOMAIN}` | frps hostname |
+| `HATCHWAY_TUNNEL_DOMAIN` | no | `tunnel.${HATCHWAY_DOMAIN}` | Tunnel wildcard root |
+| `POSTGRES_PASSWORD` | yes | — | PostgreSQL password |
+| `POSTGRES_DB` | no | `hatchway` | Database name |
+| `POSTGRES_USER` | no | `hatchway` | Database role |
+| `CLOUDFLARE_API_TOKEN` | yes | — | DNS-01 credential with Zone Read and DNS Edit |

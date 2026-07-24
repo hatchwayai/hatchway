@@ -3,43 +3,96 @@ package db
 import (
 	"context"
 	"errors"
-	"os"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/zydo/hatchway/internal/testutil"
 )
 
 func setupTestDB(t *testing.T) string {
 	t.Helper()
+	return testutil.DatabaseURL(t)
+}
 
-	// Use DATABASE_URL env var if set (CI service container)
-	if connStr := os.Getenv("DATABASE_URL"); connStr != "" {
-		return connStr
+func resetPublicSchema(t *testing.T, ctx context.Context, database *DB) {
+	t.Helper()
+	_, err := database.Pool.Exec(ctx, "DROP SCHEMA public CASCADE")
+	require.NoError(t, err)
+	_, err = database.Pool.Exec(ctx, "CREATE SCHEMA public")
+	require.NoError(t, err)
+}
+
+func TestMigrations_UpgradePopulatedV5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
 	}
 
-	// Fall back to testcontainers (local dev)
+	connStr := setupTestDB(t)
 	ctx := context.Background()
+	database, err := New(ctx, connStr)
+	require.NoError(t, err)
+	resetPublicSchema(t, ctx, database)
+	database.Close()
 
-	c, err := postgres.Run(ctx,
-		"postgres:16",
-		postgres.WithDatabase("hatchway_test"),
-		postgres.WithUsername("hatchway"),
-		postgres.WithPassword("hatchway_test"),
-		testcontainers.WithWaitStrategy(
-			wait.ForListeningPort("5432/tcp"),
-			wait.ForLog("database system is ready to accept connections"),
-		),
+	migrator, err := newMigrator(connStr)
+	require.NoError(t, err)
+	require.NoError(t, migrator.Migrate(5))
+	sourceErr, databaseErr := migrator.Close()
+	require.NoError(t, errors.Join(sourceErr, databaseErr))
+
+	database, err = New(ctx, connStr)
+	require.NoError(t, err)
+	defer database.Close()
+
+	userID := uuid.New().String()
+	tokenID := uuid.New().String()
+	_, err = database.Pool.Exec(ctx,
+		"INSERT INTO users (id, email) VALUES ($1, 'v5-upgrade@test')",
+		userID,
 	)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Terminate(ctx) })
-
-	connStr, err := c.ConnectionString(ctx, "sslmode=disable")
+	_, err = database.Pool.Exec(ctx,
+		`INSERT INTO api_tokens (id, user_id, name, token_prefix, token_hash)
+		 VALUES ($1, $2, 'v5-upgrade', 'prefix', 'hash')`,
+		tokenID, userID,
+	)
 	require.NoError(t, err)
-	return connStr
+	originalBody := []byte(`{"upgrade":"preserved"}`)
+	_, err = database.Pool.Exec(ctx,
+		`INSERT INTO idempotency_keys
+		   (token_id, key, request_hash, response_status, response_body)
+		 VALUES ($1, 'v5-key', 'request-hash', 201, $2)`,
+		tokenID, originalBody,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, RunMigrations(connStr))
+	require.NoError(t, CheckSchema(ctx, database.Pool))
+
+	var (
+		completedAt time.Time
+		storedBody  []byte
+	)
+	require.NoError(t, database.Pool.QueryRow(ctx,
+		`SELECT completed_at, response_body
+		   FROM idempotency_keys
+		  WHERE token_id = $1 AND key = 'v5-key'`,
+		tokenID,
+	).Scan(&completedAt, &storedBody))
+	require.False(t, completedAt.IsZero())
+	require.Equal(t, originalBody, storedBody)
+
+	_, err = database.Pool.Exec(ctx,
+		`INSERT INTO idempotency_keys
+		   (token_id, key, request_hash, response_status, response_body, completed_at)
+		 VALUES ($1, 'invalid-completion', 'request-hash', NULL, NULL, now())`,
+		tokenID,
+	)
+	require.Error(t, err, "completed rows without a response status must violate the completion constraint")
 }
 
 func TestMigrations_UpDownUp(t *testing.T) {
@@ -60,6 +113,29 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	defer database.Close()
 
 	err = CheckSchema(ctx, database.Pool)
+	require.NoError(t, err)
+
+	// Downgrading past migration 0003 must tolerate current encrypted cache
+	// bytes, which are intentionally neither UTF-8 nor JSON.
+	userID := uuid.New().String()
+	tokenID := uuid.New().String()
+	_, err = database.Pool.Exec(ctx,
+		"INSERT INTO users (id, email) VALUES ($1, 'migration-cache@test')",
+		userID,
+	)
+	require.NoError(t, err)
+	_, err = database.Pool.Exec(ctx,
+		`INSERT INTO api_tokens (id, user_id, name, token_prefix, token_hash)
+		 VALUES ($1, $2, 'migration-test', 'prefix', 'hash')`,
+		tokenID, userID,
+	)
+	require.NoError(t, err)
+	_, err = database.Pool.Exec(ctx,
+		`INSERT INTO idempotency_keys
+		   (token_id, key, request_hash, response_status, response_body, completed_at)
+		 VALUES ($1, 'encrypted-cache', 'request-hash', 201, $2, now())`,
+		tokenID, []byte{0xff, 0x00, 0x81},
+	)
 	require.NoError(t, err)
 
 	// Down
@@ -128,8 +204,10 @@ func TestCheckSchema_MissingTable(t *testing.T) {
 		t.Error("CheckSchema should error after dropping users")
 	}
 
-	// Restore for other tests.
-	require.NoError(t, RunMigrationsDown(connStr))
+	// Restore the shared CI database from a genuinely empty schema. A normal
+	// migration rollback cannot run after this test deliberately removed a
+	// table that older down migrations need to alter.
+	resetPublicSchema(t, ctx, database)
 	require.NoError(t, RunMigrations(connStr))
 }
 

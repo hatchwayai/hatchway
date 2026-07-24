@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -47,6 +48,12 @@ func TestParseTTLErrors(t *testing.T) {
 	}
 	if _, err := ParseTTL("-5m"); err == nil {
 		t.Error("expected error for negative TTL")
+	}
+	if _, err := ParseTTL("500ms"); err == nil {
+		t.Error("expected error for sub-second TTL")
+	}
+	if _, err := ParseTTL("1500ms"); err == nil {
+		t.Error("expected error for fractional-second TTL")
 	}
 }
 
@@ -231,7 +238,11 @@ func TestCheckLocalPort_Listening(t *testing.T) {
 	if err != nil {
 		t.Skipf("can't listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("close listener: %v", err)
+		}
+	}()
 
 	port := ln.Addr().(*net.TCPAddr).Port //nolint:errcheck
 	if err := CheckLocalPort(port); err != nil {
@@ -254,6 +265,127 @@ func TestClientCreateTunnel_ServerError(t *testing.T) {
 	// Should fall back to "HTTP 500: ..." format
 	if err.Error() == "" {
 		t.Error("error should not be empty")
+	}
+}
+
+func TestClientRetriesIdempotentCreateOnTemporaryFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"tunnel_id":"t-retried","status":"reserved","type":"http"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(&Credentials{Server: server.URL, Token: "sk_live_test"})
+	tunnel, err := client.CreateTunnel(&CreateTunnelRequest{Type: "http", LocalPort: 3000}, "retry-key")
+	if err != nil {
+		t.Fatalf("CreateTunnel() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if tunnel.TunnelID != "t-retried" {
+		t.Errorf("tunnel ID = %q", tunnel.TunnelID)
+	}
+}
+
+func TestClientRetriesIdempotencyInFlightConflict(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Header.Get("Idempotency-Key") != "in-flight-key" {
+			t.Errorf("idempotency key = %q", r.Header.Get("Idempotency-Key"))
+		}
+		if attempts == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"INVALID_REQUEST","message":"request with this idempotency key is in flight"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"tunnel_id":"t-after-conflict","status":"reserved","type":"http"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(&Credentials{Server: server.URL, Token: "sk_live_test"})
+	tunnel, err := client.CreateTunnel(&CreateTunnelRequest{Type: "http", LocalPort: 3000}, "in-flight-key")
+	if err != nil {
+		t.Fatalf("CreateTunnel() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if tunnel.TunnelID != "t-after-conflict" {
+		t.Errorf("tunnel ID = %q", tunnel.TunnelID)
+	}
+}
+
+func TestClientDoesNotRetryPermanentIdempotencyConflict(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"INVALID_REQUEST","message":"idempotency key already used with a different request body"}}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(&Credentials{Server: server.URL, Token: "sk_live_test"})
+	if _, err := client.CreateTunnel(&CreateTunnelRequest{Type: "http", LocalPort: 3000}, "reused-key"); err == nil {
+		t.Fatal("CreateTunnel() should return the permanent conflict")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestClientReplaysIdempotentCreateAfterTruncatedResponse(t *testing.T) {
+	attempts := 0
+	response := []byte(`{"tunnel_id":"t-replayed","status":"reserved","type":"http","runtime_token":"rt_recovered"}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Content-Length", strconv.Itoa(len(response)+10))
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write(response)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(&Credentials{Server: server.URL, Token: "sk_live_test"})
+	tunnel, err := client.CreateTunnel(&CreateTunnelRequest{Type: "http", LocalPort: 3000}, "response-replay-key")
+	if err != nil {
+		t.Fatalf("CreateTunnel() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if tunnel.TunnelID != "t-replayed" || tunnel.RuntimeToken != "rt_recovered" {
+		t.Errorf("unexpected replay response: %+v", tunnel)
+	}
+}
+
+func TestClientDoesNotRetryUnsafeCreateWithoutKey(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client := NewClient(&Credentials{Server: server.URL, Token: "sk_live_test"})
+	if _, err := client.CreateTunnel(&CreateTunnelRequest{Type: "http", LocalPort: 3000}, ""); err == nil {
+		t.Fatal("CreateTunnel() should return the temporary failure")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
 

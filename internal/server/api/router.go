@@ -3,35 +3,52 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zydo/hatchway/internal/config"
 	"github.com/zydo/hatchway/internal/db"
 )
 
+// RouteRegistrar mounts domain routes beneath /v1.
 type RouteRegistrar func(r chi.Router)
 
+// NewRouter builds the public API router and its middleware stack.
 func NewRouter(pool *pgxpool.Pool, cfg *config.Config, registrars ...RouteRegistrar) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
 	r.Use(RequestLogMiddleware)
+	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+		WriteError(w, http.StatusNotFound, ErrNotFound, "route not found")
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
+		WriteError(w, http.StatusMethodNotAllowed, ErrInvalidRequest, "method not allowed")
+	})
 
 	r.Get("/healthz", HealthzHandler())
 	r.Get("/readyz", ReadyzHandler(func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		return pool.Ping(ctx)
+		if err := pool.Ping(ctx); err != nil {
+			return err
+		}
+		return db.CheckSchema(ctx, pool)
 	}))
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(MaxBodySize(cfg.MaxRequestBytes))
 		r.Use(AuthMiddleware(TokenLookupFromDB(pool)))
 		r.Use(RateLimitMiddleware(NewRateLimiter(cfg.RateCreatePerMin)))
-		r.Use(IdempotencyMiddleware(pool))
+		r.Use(IdempotencyMiddleware(pool, cfg.PluginSecret))
 
 		for _, reg := range registrars {
 			reg(r)
@@ -68,13 +85,15 @@ func MaxBodySize(maxBytes int64) func(http.Handler) http.Handler {
 	}
 }
 
+// TokenLookupFromDB returns a prefix lookup backed by PostgreSQL.
 func TokenLookupFromDB(pool *pgxpool.Pool) TokenLookup {
 	return func(ctx context.Context, prefix string) ([]TokenCandidate, error) {
 		rows, err := pool.Query(ctx,
 			`SELECT t.id, t.user_id, t.token_hash, u.is_admin
 			   FROM api_tokens t
 			   JOIN users u ON u.id = t.user_id
-			  WHERE t.token_prefix = $1 AND t.revoked_at IS NULL`,
+			  WHERE t.token_prefix = $1 AND t.revoked_at IS NULL
+			  ORDER BY (t.token_hash LIKE 'sha256:%') DESC, t.created_at DESC, t.id`,
 			prefix,
 		)
 		if err != nil {
@@ -94,48 +113,69 @@ func TokenLookupFromDB(pool *pgxpool.Pool) TokenLookup {
 	}
 }
 
-// PluginHandlerFactory creates the frp plugin handler. Passed in from the caller
-// (server.go) to avoid import cycles — api cannot import tunnels or plugin directly
-// since tunnels imports api.
-type PluginHandlerFactory func() http.HandlerFunc
-
-// GlobalMetrics is the shared metrics instance for the server.
+// GlobalMetrics is the shared process metrics instance.
 var GlobalMetrics = NewMetrics()
 
-// StartServer runs the API and plugin HTTP servers. It returns when ctx is
-// cancelled or either server fails. Callers own signal handling; cancelling
-// ctx triggers graceful shutdown with a 30s deadline.
-func StartServer(ctx context.Context, cfg *config.Config, database *db.DB, pluginHandler PluginHandlerFactory, registrars ...RouteRegistrar) error {
+// StartServer runs the public API and internal control HTTP servers. It returns
+// when ctx is cancelled or either server fails. Callers own signal handling;
+// cancelling ctx triggers graceful shutdown with a 30s deadline. Handlers are
+// passed in by the caller to avoid import cycles with domain packages.
+func StartServer(
+	ctx context.Context,
+	cfg *config.Config,
+	database *db.DB,
+	pluginHandler http.Handler,
+	tunnelAuthorizationHandler http.Handler,
+	registrars ...RouteRegistrar,
+) error {
 	router := NewRouter(database.Pool, cfg, registrars...)
 
 	apiServer := &http.Server{
-		Addr:         cfg.APIAddr,
-		Handler:      router,
-		ReadTimeout:  cfg.APIReadTimeout,
-		WriteTimeout: cfg.APIWriteTimeout,
+		Addr:              cfg.APIAddr,
+		Handler:           router,
+		ReadHeaderTimeout: min(cfg.APIReadTimeout, 5*time.Second),
+		ReadTimeout:       cfg.APIReadTimeout,
+		WriteTimeout:      cfg.APIWriteTimeout,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 * 1024,
 	}
 
-	pluginMux := http.NewServeMux()
-	pluginMux.HandleFunc("/frp/plugin/{secret}", pluginHandler())
-	pluginMux.HandleFunc("/metrics", MetricsHandler(database.Pool, GlobalMetrics))
-	pluginServer := &http.Server{
-		Addr:    cfg.FRPSPluginAddr,
-		Handler: pluginMux,
+	internalMux := http.NewServeMux()
+	internalMux.Handle("/frp/plugin/{secret}", pluginHandler)
+	internalMux.Handle("/internal/tunnels/authorize/{secret}", tunnelAuthorizationHandler)
+	internalMux.HandleFunc("/metrics", MetricsHandler(database.Pool, GlobalMetrics))
+	internalServer := &http.Server{
+		Addr:              cfg.FRPSPluginAddr,
+		Handler:           internalMux,
+		ReadHeaderTimeout: min(cfg.PluginTimeout, 5*time.Second),
+		ReadTimeout:       cfg.PluginTimeout,
+		WriteTimeout:      cfg.PluginTimeout,
+		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    64 * 1024,
 	}
 
 	errCh := make(chan error, 2)
+	apiListener, err := net.Listen("tcp", cfg.APIAddr)
+	if err != nil {
+		return fmt.Errorf("listen on API address %s: %w", cfg.APIAddr, err)
+	}
+	internalListener, err := net.Listen("tcp", cfg.FRPSPluginAddr)
+	if err != nil {
+		_ = apiListener.Close()
+		return fmt.Errorf("listen on internal address %s: %w", cfg.FRPSPluginAddr, err)
+	}
 
 	go func() {
-		slog.Info("starting API server", "addr", cfg.APIAddr)
-		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+		slog.Info("starting API server", "addr", apiListener.Addr().String())
+		if err := apiServer.Serve(apiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("API server: %w", err)
 		}
 	}()
 
 	go func() {
-		slog.Info("starting plugin server", "addr", cfg.FRPSPluginAddr)
-		if err := pluginServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			errCh <- err
+		slog.Info("starting internal server", "addr", internalListener.Addr().String())
+		if err := internalServer.Serve(internalListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("internal server: %w", err)
 		}
 	}()
 
@@ -152,8 +192,24 @@ func StartServer(ctx context.Context, cfg *config.Config, database *db.DB, plugi
 	defer shutdownCancel()
 
 	slog.Info("draining HTTP servers...")
-	_ = apiServer.Shutdown(shutdownCtx)
-	_ = pluginServer.Shutdown(shutdownCtx)
+	var (
+		shutdownWG   sync.WaitGroup
+		shutdownErrs = make(chan error, 2)
+	)
+	for name, server := range map[string]*http.Server{"API": apiServer, "internal": internalServer} {
+		shutdownWG.Add(1)
+		go func() {
+			defer shutdownWG.Done()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				shutdownErrs <- fmt.Errorf("shut down %s server: %w", name, err)
+			}
+		}()
+	}
+	shutdownWG.Wait()
+	close(shutdownErrs)
+	for err := range shutdownErrs {
+		listenErr = errors.Join(listenErr, err)
+	}
 
 	slog.Info("hatchway server stopped")
 	return listenErr

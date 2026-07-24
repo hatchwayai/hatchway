@@ -1,0 +1,29 @@
+# Version-control and local tooling metadata
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local secrets and rendered runtime configuration
+.env
+.env.*
+!.env.example
+frps.toml
+
+# Build and test output
+dist/
+.release/
+coverage.out
+*.test
+*.prof
+*.out
+
+# Files that are not inputs to any container image
+docs/
+DESIGN.md
+PLAN.md
+README.md

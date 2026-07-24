@@ -9,7 +9,7 @@ import (
 const crockfordAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
 
 // GenerateTunnelID returns a t-prefixed Crockford-style identifier with 16
-// random body characters (~80 bits of entropy). Returns an error if the
+// random body characters (~79 bits of entropy). Returns an error if the
 // system entropy source fails — callers should surface this as a 500.
 func GenerateTunnelID() (string, error) {
 	const prefix = "t-"

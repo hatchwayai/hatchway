@@ -31,8 +31,7 @@ func NewClient(cred *Credentials) *Client {
 	}
 }
 
-// Tunnel API types
-
+// CreateTunnelRequest is the payload accepted by POST /v1/tunnels.
 type CreateTunnelRequest struct {
 	Type       string `json:"type"`
 	LocalHost  string `json:"local_host"`
@@ -40,6 +39,7 @@ type CreateTunnelRequest struct {
 	TTLSeconds int    `json:"ttl_seconds"`
 }
 
+// TunnelResponse is the public tunnel representation returned by the API.
 type TunnelResponse struct {
 	TunnelID     string     `json:"tunnel_id"`
 	Status       string     `json:"status"`
@@ -50,6 +50,7 @@ type TunnelResponse struct {
 	FRP          *FRPConfig `json:"frp,omitempty"`
 }
 
+// FRPConfig contains the server-authorized fields needed to start frpc.
 type FRPConfig struct {
 	ServerAddr  string `json:"server_addr"`
 	ServerPort  int    `json:"server_port"`
@@ -61,17 +62,21 @@ type FRPConfig struct {
 	LocalPort   int    `json:"local_port"`
 }
 
+// ListTunnelsResponse is one page of the tunnel-list API.
 type ListTunnelsResponse struct {
 	Tunnels    []TunnelResponse `json:"tunnels"`
-	NextCursor any              `json:"next_cursor"`
+	NextCursor *string          `json:"next_cursor"`
 }
 
+// ErrorResponse is the public API error envelope.
 type ErrorResponse struct {
 	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
 }
+
+const maxClientResponseBodySize = 1024 * 1024
 
 // CreateTunnel calls POST /v1/tunnels. If idempotencyKey is non-empty it is
 // passed as the Idempotency-Key header so safe network retries don't allocate
@@ -84,24 +89,55 @@ func (c *Client) CreateTunnel(req *CreateTunnelRequest, idempotencyKey string) (
 // you need to bound the call by something other than the client's default
 // Timeout — e.g. cleanup on Ctrl-C.
 func (c *Client) CreateTunnelCtx(ctx context.Context, req *CreateTunnelRequest, idempotencyKey string) (*TunnelResponse, error) {
-	body, _ := json.Marshal(req)
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	headers := map[string]string{}
 	if idempotencyKey != "" {
 		headers["Idempotency-Key"] = idempotencyKey
 	}
-	resp, err := c.doCtx(ctx, "POST", "/v1/tunnels", body, headers)
+
+	// A create may commit even if its 201 response is truncated in transit.
+	// One same-key replay recovers the cached response and its one-time runtime
+	// credential without allocating another tunnel.
+	const maxDecodeAttempts = 2
+	for attempt := 1; ; attempt++ {
+		resp, err := c.doCtx(ctx, "POST", "/v1/tunnels", body, headers)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusCreated {
+			err := parseError(resp)
+			closeResponseBody(resp)
+			return nil, err
+		}
+
+		tunnel, decodeErr := decodeTunnelResponse(resp)
+		closeResponseBody(resp)
+		if decodeErr == nil {
+			return tunnel, nil
+		}
+		if idempotencyKey == "" || attempt == maxDecodeAttempts {
+			return nil, decodeErr
+		}
+		if err := waitForRetry(ctx, retryDelay(nil, attempt)); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func decodeTunnelResponse(resp *http.Response) (*TunnelResponse, error) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxClientResponseBodySize+1))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read create response: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return nil, parseError(resp)
+	if len(body) > maxClientResponseBodySize {
+		return nil, fmt.Errorf("create response exceeds %d bytes", maxClientResponseBodySize)
 	}
-
 	var tunnel TunnelResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tunnel); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	if err := json.Unmarshal(body, &tunnel); err != nil {
+		return nil, fmt.Errorf("decode create response: %w", err)
 	}
 	return &tunnel, nil
 }
@@ -112,9 +148,11 @@ func (c *Client) ListTunnels(limit int) (*ListTunnelsResponse, error) {
 	return c.ListTunnelsCtx(context.Background(), limit)
 }
 
+// ListTunnelsCtx is the context-aware variant of ListTunnels.
 func (c *Client) ListTunnelsCtx(ctx context.Context, limit int) (*ListTunnelsResponse, error) {
 	all := &ListTunnelsResponse{}
 	cursor := ""
+	seenCursors := make(map[string]struct{})
 	for {
 		path := "/v1/tunnels"
 		q := url.Values{}
@@ -128,6 +166,7 @@ func (c *Client) ListTunnelsCtx(ctx context.Context, limit int) (*ListTunnelsRes
 			path = path + "?" + encoded
 		}
 
+		//nolint:bodyclose // decodeListPage owns and closes the response body.
 		resp, err := c.doCtx(ctx, "GET", path, nil, nil)
 		if err != nil {
 			return nil, err
@@ -138,17 +177,20 @@ func (c *Client) ListTunnelsCtx(ctx context.Context, limit int) (*ListTunnelsRes
 		}
 		all.Tunnels = append(all.Tunnels, page.Tunnels...)
 
-		next, _ := page.NextCursor.(string)
-		if next == "" {
+		if page.NextCursor == nil || *page.NextCursor == "" {
 			all.NextCursor = nil
 			return all, nil
 		}
-		cursor = next
+		if _, seen := seenCursors[*page.NextCursor]; seen {
+			return nil, fmt.Errorf("server returned a repeated pagination cursor")
+		}
+		seenCursors[*page.NextCursor] = struct{}{}
+		cursor = *page.NextCursor
 	}
 }
 
 func decodeListPage(resp *http.Response) (*ListTunnelsResponse, error) {
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseError(resp)
 	}
@@ -164,12 +206,13 @@ func (c *Client) GetTunnel(id string) (*TunnelResponse, error) {
 	return c.GetTunnelCtx(context.Background(), id)
 }
 
+// GetTunnelCtx is the context-aware variant of GetTunnel.
 func (c *Client) GetTunnelCtx(ctx context.Context, id string) (*TunnelResponse, error) {
-	resp, err := c.doCtx(ctx, "GET", "/v1/tunnels/"+id, nil, nil)
+	resp, err := c.doCtx(ctx, "GET", "/v1/tunnels/"+url.PathEscape(id), nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseError(resp)
@@ -187,12 +230,13 @@ func (c *Client) DeleteTunnel(id string) error {
 	return c.DeleteTunnelCtx(context.Background(), id)
 }
 
+// DeleteTunnelCtx is the context-aware variant of DeleteTunnel.
 func (c *Client) DeleteTunnelCtx(ctx context.Context, id string) error {
-	resp, err := c.doCtx(ctx, "DELETE", "/v1/tunnels/"+id, nil, nil)
+	resp, err := c.doCtx(ctx, "DELETE", "/v1/tunnels/"+url.PathEscape(id), nil, nil)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusNoContent {
 		return parseError(resp)
@@ -205,12 +249,13 @@ func (c *Client) Whoami() (string, error) {
 	return c.WhoamiCtx(context.Background())
 }
 
+// WhoamiCtx is the context-aware variant of Whoami.
 func (c *Client) WhoamiCtx(ctx context.Context) (string, error) {
 	resp, err := c.doCtx(ctx, "GET", "/v1/me", nil, nil)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", parseError(resp)
@@ -226,32 +271,98 @@ func (c *Client) WhoamiCtx(ctx context.Context) (string, error) {
 }
 
 func (c *Client) doCtx(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
-	var bodyReader io.Reader
-	if body != nil {
-		bodyReader = bytes.NewReader(body)
-	}
+	const maxAttempts = 3
+	retryableRequest := method == http.MethodGet || method == http.MethodHead || method == http.MethodDelete || headers["Idempotency-Key"] != ""
+	retryIdempotencyConflict := headers["Idempotency-Key"] != ""
 
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bodyReader)
+	for attempt := 1; ; attempt++ {
+		var bodyReader io.Reader
+		if body != nil {
+			bodyReader = bytes.NewReader(body)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, bodyReader)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+
+		resp, err := c.HTTPClient.Do(req)
+		if !retryableRequest || attempt == maxAttempts || !shouldRetry(resp, err, retryIdempotencyConflict) {
+			return resp, err
+		}
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+			_ = resp.Body.Close()
+		}
+		if err := waitForRetry(ctx, retryDelay(resp, attempt)); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func shouldRetry(resp *http.Response, err error, retryIdempotencyConflict bool) bool {
 	if err != nil {
-		return nil, err
+		return true
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if resp == nil {
+		return false
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	switch resp.StatusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	case http.StatusConflict:
+		return retryIdempotencyConflict && resp.Header.Get("Retry-After") != ""
+	default:
+		return false
 	}
-	return c.HTTPClient.Do(req)
+}
+
+func retryDelay(resp *http.Response, attempt int) time.Duration {
+	delay := time.Duration(1<<(attempt-1)) * 100 * time.Millisecond
+	if resp == nil {
+		return delay
+	}
+	retryAfter, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || retryAfter < 0 {
+		return delay
+	}
+	const maxRetryAfter = 5 * time.Second
+	serverDelay := min(time.Duration(retryAfter)*time.Second, maxRetryAfter)
+	return max(delay, serverDelay)
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func parseError(resp *http.Response) error {
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if err != nil {
+		return fmt.Errorf("read HTTP %d error response: %w", resp.StatusCode, err)
+	}
 	var errResp ErrorResponse
 	if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
 		return fmt.Errorf("%s: %s", errResp.Error.Code, errResp.Error.Message)
 	}
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+}
+
+func closeResponseBody(resp *http.Response) {
+	_ = resp.Body.Close()
 }
 
 // ParseTTL parses a human-friendly TTL string like "15m", "1h", "24h". The
@@ -266,6 +377,9 @@ func ParseTTL(s string) (time.Duration, error) {
 	if d <= 0 {
 		return 0, fmt.Errorf("TTL must be positive, got %s", s)
 	}
+	if d < time.Second || d%time.Second != 0 {
+		return 0, fmt.Errorf("TTL must be a whole number of seconds and at least 1s, got %s", s)
+	}
 	return d, nil
 }
 
@@ -276,6 +390,8 @@ func CheckLocalPort(port int) error {
 	if err != nil {
 		return fmt.Errorf("nothing listening on %s: %w", addr, err)
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		return fmt.Errorf("close local port probe: %w", err)
+	}
 	return nil
 }

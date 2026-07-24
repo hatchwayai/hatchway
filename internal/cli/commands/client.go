@@ -89,6 +89,7 @@ func authWhoamiCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "whoami",
 		Short: "Verify the saved token",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cred, err := cli.ResolveCredentials()
 			if err != nil {
@@ -122,6 +123,7 @@ func authLogoutCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "logout",
 		Short: "Remove the saved token",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := cli.DeleteCredentials(); err != nil {
 				return err
@@ -156,12 +158,13 @@ func httpCmd() *cobra.Command {
 				return err
 			}
 
-			ttlDuration := 3600 * time.Second
+			ttlSeconds := 0 // Let the server choose its configured default.
 			if ttl != "" {
-				ttlDuration, err = cli.ParseTTL(ttl)
+				ttlDuration, err := cli.ParseTTL(ttl)
 				if err != nil {
 					return err
 				}
+				ttlSeconds = int(ttlDuration / time.Second)
 			}
 
 			const localHost = "127.0.0.1"
@@ -172,30 +175,37 @@ func httpCmd() *cobra.Command {
 				Type:       "http",
 				LocalHost:  localHost,
 				LocalPort:  port,
-				TTLSeconds: int(ttlDuration.Seconds()),
+				TTLSeconds: ttlSeconds,
 			}, idempotencyKey)
 			if err != nil {
 				return fmt.Errorf("create tunnel: %w", err)
 			}
 
-			if asJSON {
-				out, _ := json.Marshal(map[string]string{
-					"tunnel_id":  tunnel.TunnelID,
-					"public_url": tunnel.PublicURL,
-					"status":     tunnel.Status,
-				})
-				fmt.Println(string(out))
-			} else {
-				fmt.Fprintf(os.Stderr, "Tunnel created: %s\n", tunnel.PublicURL)
-			}
+			// From this point onward, any exit tears down the reservation.
+			// This includes config/temp-file failures, clean frpc exits,
+			// signals, and exhausted restarts.
+			defer func() {
+				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer deleteCancel()
+				if err := client.DeleteTunnelCtx(deleteCtx, tunnel.TunnelID); err != nil {
+					slog.Warn("tunnel cleanup failed", "tunnel_id", tunnel.TunnelID, "error", err)
+				}
+			}()
 
 			// Generate frpc.toml in temp dir
-			frpcConfig := generateFRPCConfig(tunnel, localHost, port)
+			frpcConfig, err := generateFRPCConfig(tunnel, localHost, port)
+			if err != nil {
+				return fmt.Errorf("build frpc config: %w", err)
+			}
 			tmpDir, err := os.MkdirTemp("", "hatchway-frpc-*")
 			if err != nil {
 				return fmt.Errorf("create temp dir: %w", err)
 			}
-			defer os.RemoveAll(tmpDir)
+			defer func() {
+				if err := os.RemoveAll(tmpDir); err != nil {
+					slog.Warn("temporary frpc config cleanup failed", "path", tmpDir, "error", err)
+				}
+			}()
 
 			configPath := filepath.Join(tmpDir, "frpc.toml")
 			if err := os.WriteFile(configPath, []byte(frpcConfig), 0600); err != nil {
@@ -203,12 +213,9 @@ func httpCmd() *cobra.Command {
 			}
 
 			// Spawn frpc subprocess
-			frpcPath, err := exec.LookPath("frpc")
+			frpcPath, err := findFRPC()
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "Warning: frpc not found in PATH. Tunnel is reserved but not connected.")
-				fmt.Fprintln(os.Stderr, "Install frp or use the tunnel manually with the config below:")
-				fmt.Fprintln(os.Stderr, frpcConfig)
-				return nil
+				return err
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -216,8 +223,11 @@ func httpCmd() *cobra.Command {
 
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
 
 			runFRPC := func() *exec.Cmd {
+				// #nosec G204 -- frpcPath is a resolved binary path and
+				// arguments are passed directly without a shell.
 				c := exec.CommandContext(ctx, frpcPath, "-c", configPath)
 				c.Stderr = os.Stderr
 				return c
@@ -228,14 +238,16 @@ func httpCmd() *cobra.Command {
 				return fmt.Errorf("start frpc: %w", err)
 			}
 
-			cleanup := func() {
-				cancel()
-				// Best-effort revoke with a short deadline so Ctrl-C never
-				// hangs. Use a context detached from the cancelled `ctx`
-				// above so the request can actually go out.
-				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer deleteCancel()
-				_ = client.DeleteTunnelCtx(deleteCtx, tunnel.TunnelID)
+			if asJSON {
+				if err := json.NewEncoder(os.Stdout).Encode(map[string]string{
+					"tunnel_id":  tunnel.TunnelID,
+					"public_url": tunnel.PublicURL,
+					"status":     tunnel.Status,
+				}); err != nil {
+					return fmt.Errorf("write tunnel result: %w", err)
+				}
+			} else {
+				fmt.Println(tunnel.PublicURL)
 			}
 
 			restarts := 0
@@ -246,7 +258,7 @@ func httpCmd() *cobra.Command {
 				select {
 				case sig := <-sigCh:
 					fmt.Fprintf(os.Stderr, "\nReceived %s, cleaning up...\n", sig)
-					cleanup()
+					cancel()
 					return nil
 				case err := <-doneCh:
 					if err == nil {
@@ -254,7 +266,6 @@ func httpCmd() *cobra.Command {
 					}
 					slog.Warn("frpc exited unexpectedly", "error", err, "restart", restarts+1, "max", maxFRPCRestarts)
 					if restarts >= maxFRPCRestarts {
-						cleanup()
 						return fmt.Errorf("frpc failed after %d restarts: %w", maxFRPCRestarts, err)
 					}
 					restarts++
@@ -263,12 +274,10 @@ func httpCmd() *cobra.Command {
 					select {
 					case <-time.After(backoff):
 					case <-sigCh:
-						cleanup()
 						return nil
 					}
 					frpcCmd = runFRPC()
 					if err := frpcCmd.Start(); err != nil {
-						cleanup()
 						return fmt.Errorf("restart frpc: %w", err)
 					}
 				}
@@ -286,7 +295,8 @@ func listCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List active tunnels",
+		Short: "List all tunnels owned by the current user",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cred, err := cli.ResolveCredentials()
 			if err != nil {
@@ -311,12 +321,15 @@ func listCmd() *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "ID\tTYPE\tSTATUS\tURL")
-			for _, t := range list.Tunnels {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.TunnelID, t.Type, t.Status, t.PublicURL)
+			if _, err := fmt.Fprintln(w, "ID\tTYPE\tSTATUS\tURL"); err != nil {
+				return fmt.Errorf("write tunnel table header: %w", err)
 			}
-			w.Flush()
-			return nil
+			for _, t := range list.Tunnels {
+				if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.TunnelID, t.Type, t.Status, t.PublicURL); err != nil {
+					return fmt.Errorf("write tunnel table row: %w", err)
+				}
+			}
+			return w.Flush()
 		},
 	}
 
@@ -327,7 +340,7 @@ func listCmd() *cobra.Command {
 func deleteCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "delete <tunnel_id>",
-		Short: "Delete a tunnel",
+		Short: "Revoke a tunnel",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cred, err := cli.ResolveCredentials()
@@ -340,7 +353,7 @@ func deleteCmd() *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(os.Stderr, "Tunnel %s deleted.\n", args[0])
+			fmt.Fprintf(os.Stderr, "Tunnel %s revoked.\n", args[0])
 			return nil
 		},
 	}
@@ -350,6 +363,7 @@ func tcpCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "tcp <port>",
 		Short: "Create a TCP tunnel (not yet supported)",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("TCP tunnels are not yet supported in this version")
 		},
@@ -360,35 +374,74 @@ func udpCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "udp <port>",
 		Short: "Create a UDP tunnel (not yet supported)",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("UDP tunnels are not yet supported in this version")
 		},
 	}
 }
 
-func generateFRPCConfig(tunnel *cli.TunnelResponse, localHost string, localPort int) string {
-	if localHost == "" {
-		localHost = "127.0.0.1"
+func generateFRPCConfig(tunnel *cli.TunnelResponse, requestedLocalHost string, requestedLocalPort int) (string, error) {
+	if tunnel == nil || tunnel.FRP == nil {
+		return "", fmt.Errorf("create response is missing frp configuration")
 	}
-	return fmt.Sprintf(`serverAddr = "%s"
+	frpConfig := tunnel.FRP
+	if tunnel.TunnelID == "" ||
+		tunnel.RuntimeToken == "" ||
+		frpConfig.ServerAddr == "" ||
+		frpConfig.ServerPort < 1 || frpConfig.ServerPort > 65535 ||
+		frpConfig.ServerToken == "" ||
+		frpConfig.ProxyName == "" ||
+		frpConfig.ProxyType == "" ||
+		frpConfig.Subdomain == "" ||
+		frpConfig.LocalIP == "" ||
+		frpConfig.LocalPort < 1 || frpConfig.LocalPort > 65535 {
+		return "", fmt.Errorf("create response contains incomplete frp configuration")
+	}
+	if frpConfig.ProxyName != tunnel.TunnelID ||
+		frpConfig.Subdomain != tunnel.TunnelID ||
+		frpConfig.ProxyType != "http" {
+		return "", fmt.Errorf("create response contains inconsistent tunnel identity")
+	}
+	if requestedLocalHost == "" ||
+		requestedLocalPort < 1 || requestedLocalPort > 65535 ||
+		frpConfig.LocalIP != requestedLocalHost ||
+		frpConfig.LocalPort != requestedLocalPort {
+		return "", fmt.Errorf("create response local target does not match the requested service")
+	}
+	return fmt.Sprintf(`serverAddr = %s
 serverPort = %d
 
 auth.method = "token"
-auth.token = "%s"
+auth.token = %s
 
-metadatas.runtime_token = "%s"
+metadatas.runtime_token = %s
 
 [[proxies]]
-name = "%s"
-type = "%s"
-localIP = "%s"
+name = %s
+type = %s
+localIP = %s
 localPort = %d
-subdomain = "%s"
-`, tunnel.FRP.ServerAddr, tunnel.FRP.ServerPort,
-		tunnel.FRP.ServerToken,
-		tunnel.RuntimeToken,
-		tunnel.TunnelID, tunnel.FRP.ProxyType,
-		localHost, localPort,
-		tunnel.TunnelID,
-	)
+subdomain = %s
+`, strconv.Quote(frpConfig.ServerAddr), frpConfig.ServerPort,
+		strconv.Quote(frpConfig.ServerToken),
+		strconv.Quote(tunnel.RuntimeToken),
+		strconv.Quote(frpConfig.ProxyName), strconv.Quote(frpConfig.ProxyType),
+		strconv.Quote(requestedLocalHost), requestedLocalPort,
+		strconv.Quote(frpConfig.Subdomain),
+	), nil
+}
+
+func findFRPC() (string, error) {
+	if executable, err := os.Executable(); err == nil {
+		sibling := filepath.Join(filepath.Dir(executable), "frpc")
+		if info, statErr := os.Stat(sibling); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
+			return sibling, nil
+		}
+	}
+	path, err := exec.LookPath("frpc")
+	if err != nil {
+		return "", fmt.Errorf("frpc not found next to hatchway or in PATH: %w", err)
+	}
+	return path, nil
 }

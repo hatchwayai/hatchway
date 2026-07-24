@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,14 +14,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/zydo/hatchway/internal/config"
 	"github.com/zydo/hatchway/internal/db"
 	"github.com/zydo/hatchway/internal/server/api"
 	"github.com/zydo/hatchway/internal/server/tunnels"
+	"github.com/zydo/hatchway/internal/testutil"
 	"github.com/zydo/hatchway/internal/tokens"
 )
 
@@ -45,25 +43,7 @@ func setupFixture(t *testing.T) *fixture {
 		t.Skip("skipping integration test")
 	}
 
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		ctx := context.Background()
-		c, err := postgres.Run(ctx,
-			"postgres:16",
-			postgres.WithDatabase("hatchway_test"),
-			postgres.WithUsername("hatchway"),
-			postgres.WithPassword("hatchway_test"),
-			testcontainers.WithWaitStrategy(
-				wait.ForListeningPort("5432/tcp"),
-				wait.ForLog("database system is ready to accept connections"),
-			),
-		)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = c.Terminate(ctx) })
-
-		connStr, err = c.ConnectionString(ctx, "sslmode=disable")
-		require.NoError(t, err)
-	}
+	connStr := testutil.DatabaseURL(t)
 
 	require.NoError(t, db.RunMigrations(connStr))
 
@@ -122,6 +102,21 @@ func mustMintToken(t *testing.T, pool *pgxpool.Pool, userID, label string) strin
 	)
 	require.NoError(t, err)
 	return tok.Raw
+}
+
+func mustStoreRuntimeToken(t *testing.T, pool *pgxpool.Pool, tunnelID string) string {
+	t.Helper()
+	token, err := tokens.MintRuntimeToken()
+	require.NoError(t, err)
+	tokenID := uuid.New().String()
+	_, err = pool.Exec(context.Background(),
+		`INSERT INTO tunnel_runtime_tokens
+		   (id, tunnel_id, token_prefix, token_hash, expires_at)
+		 VALUES ($1, $2, $3, $4, now() + interval '1 hour')`,
+		tokenID, tunnelID, token.Prefix, token.Hash,
+	)
+	require.NoError(t, err)
+	return tokenID
 }
 
 func (f *fixture) do(t *testing.T, method, path, token, body, idempotencyKey string) *httptest.ResponseRecorder {
@@ -233,6 +228,63 @@ func TestIntegration_DeleteIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestIntegration_ConcurrentDeleteIsIdempotentAndAtomic(t *testing.T) {
+	f := setupFixture(t)
+	ctx := context.Background()
+	tunnelID := "t-concurrentdel01"
+	_, err := f.pool.Exec(ctx,
+		`INSERT INTO tunnels
+		   (id, user_id, type, local_host, local_port, status, expires_at)
+		 VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() + interval '1 hour')`,
+		tunnelID, f.userID,
+	)
+	require.NoError(t, err)
+	tokenID := mustStoreRuntimeToken(t, f.pool, tunnelID)
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodDelete, "/v1/tunnels/"+tunnelID, nil)
+			req.Header.Set("Authorization", "Bearer "+f.userToken)
+			rec := httptest.NewRecorder()
+			f.router.ServeHTTP(rec, req)
+			statuses <- rec.Code
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+
+	for status := range statuses {
+		if status != http.StatusNoContent {
+			t.Errorf("concurrent DELETE status = %d, want 204", status)
+		}
+	}
+
+	var (
+		status       string
+		tokenRevoked bool
+		revokeEvents int
+	)
+	require.NoError(t, f.pool.QueryRow(ctx,
+		"SELECT status FROM tunnels WHERE id = $1", tunnelID,
+	).Scan(&status))
+	require.Equal(t, "revoked", status)
+	require.NoError(t, f.pool.QueryRow(ctx,
+		"SELECT revoked_at IS NOT NULL FROM tunnel_runtime_tokens WHERE id = $1", tokenID,
+	).Scan(&tokenRevoked))
+	require.True(t, tokenRevoked)
+	require.NoError(t, f.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM tunnel_events WHERE tunnel_id = $1 AND event_type = 'Revoke'", tunnelID,
+	).Scan(&revokeEvents))
+	require.Equal(t, 1, revokeEvents)
+}
+
 func TestIntegration_CreateTunnelReturnsFRPSAuthToken(t *testing.T) {
 	f := setupFixture(t)
 	// Distinct from the plugin secret — verify the API response uses the auth
@@ -310,11 +362,53 @@ func TestIntegration_IdempotencyReplay(t *testing.T) {
 		t.Fatalf("idempotency replay created %d tunnels, want 1", count)
 	}
 
+	var createResponse struct {
+		RuntimeToken string `json:"runtime_token"`
+	}
+	require.NoError(t, json.Unmarshal(w1.Body.Bytes(), &createResponse))
+	var cachedBody []byte
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		"SELECT response_body FROM idempotency_keys WHERE key = $1", key,
+	).Scan(&cachedBody))
+	if strings.Contains(string(cachedBody), createResponse.RuntimeToken) {
+		t.Fatal("idempotency cache stored the runtime token in plaintext")
+	}
+
 	// Different body, same key → 409.
 	other := `{"type":"http","local_port":3001,"ttl_seconds":300}`
 	w3 := f.do(t, "POST", "/v1/tunnels", f.userToken, other, key)
 	if w3.Code != http.StatusConflict {
 		t.Fatalf("different body, same key: expected 409, got %d", w3.Code)
+	}
+}
+
+func TestIntegration_IdempotencyKeyCannotReplayAcrossPaths(t *testing.T) {
+	f := setupFixture(t)
+	ctx := context.Background()
+	ids := []string{"t-idempath000000a", "t-idempath000000b"}
+	for _, id := range ids {
+		_, err := f.pool.Exec(ctx,
+			`INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at)
+			 VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() + interval '1 hour')`,
+			id, f.userID,
+		)
+		require.NoError(t, err)
+	}
+
+	key := uuid.New().String()
+	first := f.do(t, "DELETE", "/v1/tunnels/"+ids[0], f.userToken, "", key)
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("first delete: %d body=%s", first.Code, first.Body.String())
+	}
+	second := f.do(t, "DELETE", "/v1/tunnels/"+ids[1], f.userToken, "", key)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("cross-path key reuse: got %d, want 409", second.Code)
+	}
+
+	var status string
+	require.NoError(t, f.pool.QueryRow(ctx, "SELECT status FROM tunnels WHERE id = $1", ids[1]).Scan(&status))
+	if status != "reserved" {
+		t.Fatalf("second tunnel status = %q; cached response was replayed across paths", status)
 	}
 }
 
@@ -429,12 +523,80 @@ func TestIntegration_CreateRespectsQuota(t *testing.T) {
 	}
 }
 
+func TestIntegration_ConcurrentCreatesCannotExceedQuota(t *testing.T) {
+	f := setupFixture(t)
+	f.cfg.MaxConcurrent = 1
+
+	const workers = 2
+	start := make(chan struct{})
+	statuses := make(chan int, workers)
+	body := `{"type":"http","local_port":3000,"ttl_seconds":300}`
+	for range workers {
+		go func() {
+			<-start
+			statuses <- f.do(t, "POST", "/v1/tunnels", f.userToken, body, uuid.New().String()).Code
+		}()
+	}
+	close(start)
+
+	counts := make(map[int]int)
+	for range workers {
+		counts[<-statuses]++
+	}
+	if counts[http.StatusCreated] != 1 || counts[http.StatusForbidden] != 1 {
+		t.Fatalf("concurrent statuses = %#v, want one 201 and one 403", counts)
+	}
+
+	var count int
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		"SELECT COUNT(*) FROM tunnels WHERE user_id = $1 AND status IN ('reserved','active','closed')",
+		f.userID,
+	).Scan(&count))
+	if count != 1 {
+		t.Fatalf("non-terminal tunnel count = %d, want 1", count)
+	}
+}
+
 func TestIntegration_CreateRejectsTTLOverMax(t *testing.T) {
 	f := setupFixture(t)
 	body := `{"type":"http","local_port":3000,"ttl_seconds":999999999}`
 	w := f.do(t, "POST", "/v1/tunnels", f.userToken, body, "")
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestIntegration_CreateDefaultTTLDoesNotExceedConfiguredMaximum(t *testing.T) {
+	f := setupFixture(t)
+	f.cfg.MaxTTL = 30 * time.Minute
+	started := time.Now()
+
+	w := f.do(t, "POST", "/v1/tunnels", f.userToken, `{"type":"http","local_port":3000}`, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create: %d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	ttl := resp.ExpiresAt.Sub(started)
+	if ttl < 29*time.Minute || ttl > 31*time.Minute {
+		t.Fatalf("default TTL = %s, want approximately 30m", ttl)
+	}
+}
+
+func TestIntegration_CreateRejectsUnknownFieldsAndTrailingJSON(t *testing.T) {
+	f := setupFixture(t)
+	for name, body := range map[string]string{
+		"unknown field":  `{"type":"http","local_port":3000,"ttl_seconds":300,"typo":true}`,
+		"trailing value": `{"type":"http","local_port":3000,"ttl_seconds":300} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := f.do(t, "POST", "/v1/tunnels", f.userToken, body, "")
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 
@@ -470,10 +632,19 @@ func TestIntegration_AdminRevokeOnAlreadyRevokedIsIdempotent(t *testing.T) {
 		tunnelID, f.userID,
 	)
 	require.NoError(t, err)
+	tokenID := mustStoreRuntimeToken(t, f.pool, tunnelID)
 
 	w := f.do(t, "POST", "/v1/admin/tunnels/"+tunnelID+"/revoke", f.adminToken, "", "")
 	if w.Code != http.StatusNoContent {
 		t.Errorf("admin revoke on revoked should be 204, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var tokenRevoked bool
+	require.NoError(t, f.pool.QueryRow(context.Background(),
+		"SELECT revoked_at IS NOT NULL FROM tunnel_runtime_tokens WHERE id = $1", tokenID,
+	).Scan(&tokenRevoked))
+	if !tokenRevoked {
+		t.Error("idempotent revoke should repair a live runtime credential")
 	}
 }
 
@@ -481,45 +652,23 @@ func TestIntegration_IdempotencyOversizeReplay(t *testing.T) {
 	f := setupFixture(t)
 	ctx := context.Background()
 
-	// Pre-seed an idempotency row whose body cache is NULL (simulates the
-	// "response too large to cache" code path). Replay must surface the
-	// retry-without-key error, not return a corrupt body.
+	// Create a real reservation so its method/path/body fingerprint is current,
+	// then simulate the "response too large to cache" completion state.
 	var tokenID string
 	require.NoError(t, f.pool.QueryRow(ctx,
 		"SELECT id FROM api_tokens WHERE user_id = $1 LIMIT 1", f.userID,
 	).Scan(&tokenID))
 	bodyJSON := `{"type":"http","local_port":3000,"ttl_seconds":300}`
-	// SHA-256 of the body; must match what the middleware computes.
-	hash := "f3a47e64eb33d57bf94a3f7d9d6b6f0d3cf9c0a32a8bba6bd17e8b6bb1f30ea1"
+	first := f.do(t, "POST", "/v1/tunnels", f.userToken, bodyJSON, "oversize-key")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("initial request: %d body=%s", first.Code, first.Body.String())
+	}
 	_, err := f.pool.Exec(ctx,
-		`INSERT INTO idempotency_keys (token_id, key, request_hash, response_status, response_body, completed_at)
-		 VALUES ($1, 'oversize-key', $2, 201, NULL, now())`,
-		tokenID, hash,
+		`UPDATE idempotency_keys SET response_body = NULL
+		  WHERE token_id = $1 AND key = 'oversize-key'`,
+		tokenID,
 	)
 	require.NoError(t, err)
-	// Force the hash to actually match by overwriting with the real digest.
-	_, err = f.pool.Exec(ctx,
-		`UPDATE idempotency_keys SET request_hash = encode(digest($1::bytea, 'sha256'), 'hex')
-		   WHERE token_id = $2 AND key = 'oversize-key'`,
-		[]byte(bodyJSON), tokenID,
-	)
-	if err != nil {
-		// pgcrypto extension might not be enabled — fall back to letting the
-		// idempotency middleware notice mismatch (409). Either branch covers
-		// the relevant path; just record which one we exercised.
-		t.Logf("digest function unavailable; will exercise body-mismatch path instead")
-	}
-
-	// Need pgcrypto for digest(); enable if available.
-	_, _ = f.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pgcrypto")
-	_, err = f.pool.Exec(ctx,
-		`UPDATE idempotency_keys SET request_hash = encode(digest($1::bytea, 'sha256'), 'hex')
-		   WHERE token_id = $2 AND key = 'oversize-key'`,
-		[]byte(bodyJSON), tokenID,
-	)
-	if err != nil {
-		t.Skipf("pgcrypto unavailable in test image: %v", err)
-	}
 
 	w := f.do(t, "POST", "/v1/tunnels", f.userToken, bodyJSON, "oversize-key")
 	if w.Code != http.StatusInternalServerError {
@@ -540,16 +689,17 @@ func TestIntegration_IdempotencyInFlightReturnsConflict(t *testing.T) {
 	).Scan(&tokenID))
 
 	bodyJSON := `{"type":"http","local_port":3000,"ttl_seconds":300}`
-	_, _ = f.pool.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pgcrypto")
-	// Seed an unfinished reservation: same body hash, completed_at NULL.
-	_, err := f.pool.Exec(ctx,
-		`INSERT INTO idempotency_keys (token_id, key, request_hash)
-		 VALUES ($1, 'inflight-key', encode(digest($2::bytea, 'sha256'), 'hex'))`,
-		tokenID, []byte(bodyJSON),
-	)
-	if err != nil {
-		t.Skipf("pgcrypto unavailable: %v", err)
+	first := f.do(t, "POST", "/v1/tunnels", f.userToken, bodyJSON, "inflight-key")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("initial request: %d body=%s", first.Code, first.Body.String())
 	}
+	_, err := f.pool.Exec(ctx,
+		`UPDATE idempotency_keys
+		    SET response_status = NULL, response_body = NULL, completed_at = NULL
+		  WHERE token_id = $1 AND key = 'inflight-key'`,
+		tokenID,
+	)
+	require.NoError(t, err)
 
 	w := f.do(t, "POST", "/v1/tunnels", f.userToken, bodyJSON, "inflight-key")
 	if w.Code != http.StatusConflict {
@@ -557,6 +707,9 @@ func TestIntegration_IdempotencyInFlightReturnsConflict(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "in flight") {
 		t.Errorf("expected in-flight error, got %s", w.Body.String())
+	}
+	if w.Header().Get("Retry-After") == "" {
+		t.Error("in-flight conflict should tell idempotent clients to retry")
 	}
 }
 
@@ -639,35 +792,13 @@ func TestIntegration_ListTunnelsCursorPagination(t *testing.T) {
 	}
 }
 
-// TestIntegration_ListTunnelsInvalidLimitFallsBackToDefault covers the
-// limit-parsing branch in ListTunnels: non-numeric, zero, negative, and
-// over-max values should all silently fall back to defaultListLimit rather
-// than erroring or applying an out-of-range limit to the query.
-func TestIntegration_ListTunnelsInvalidLimitFallsBackToDefault(t *testing.T) {
+func TestIntegration_ListTunnelsRejectsInvalidLimit(t *testing.T) {
 	f := setupFixture(t)
-
-	for i := range 3 {
-		id := "t-invlim0000000" + string(rune('a'+i))
-		_, err := f.pool.Exec(context.Background(),
-			"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, 'http', '127.0.0.1', 3000, 'reserved', now() + interval '1 hour')",
-			id, f.userID,
-		)
-		require.NoError(t, err)
-	}
-
-	type listResp struct {
-		Tunnels []map[string]any `json:"tunnels"`
-	}
 
 	for _, q := range []string{"limit=0", "limit=-1", "limit=101", "limit=not-a-number"} {
 		w := f.do(t, "GET", "/v1/tunnels?"+q, f.userToken, "", "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s: expected 200, got %d body=%s", q, w.Code, w.Body.String())
-		}
-		var page listResp
-		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &page))
-		if len(page.Tunnels) != 3 {
-			t.Errorf("%s: expected all 3 tunnels (default limit), got %d", q, len(page.Tunnels))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d body=%s", q, w.Code, w.Body.String())
 		}
 	}
 }

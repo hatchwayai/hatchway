@@ -1,6 +1,7 @@
 # Caddyfile — Hatchway reverse proxy configuration
 #
-# Replace example.com with your actual domain.
+# Site names are supplied through HATCHWAY_API_DOMAIN and
+# HATCHWAY_TUNNEL_DOMAIN.
 # The DNS-01 challenge requires a custom Caddy build with the appropriate
 # DNS provider plugin (see Dockerfile.caddy).
 
@@ -10,7 +11,13 @@
 
 *.{$HATCHWAY_TUNNEL_DOMAIN} {
 	tls {
-		dns cloudflare {$CLOUDFLARE_API_TOKEN}
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	# Authorize every HTTP request against Hatchway's database-clock tunnel
+	# state before sending it to frps. header_up overwrites any client value.
+	forward_auth hatchway-server:9001 {
+		uri /internal/tunnels/authorize/{$HATCHWAY_PLUGIN_SECRET}
+		header_up X-Hatchway-Tunnel-Host {http.request.host}
 	}
 	reverse_proxy frps:8081
 }

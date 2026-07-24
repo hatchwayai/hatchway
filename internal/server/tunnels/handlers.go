@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/zydo/hatchway/internal/tokens"
 )
 
+// CreateTunnelRequest is the strictly decoded POST /v1/tunnels payload.
 type CreateTunnelRequest struct {
 	Type       string `json:"type"`
 	LocalHost  string `json:"local_host"`
@@ -27,6 +29,7 @@ type CreateTunnelRequest struct {
 	TTLSeconds int    `json:"ttl_seconds"`
 }
 
+// TunnelResponse is the owner-visible API representation of a tunnel.
 type TunnelResponse struct {
 	TunnelID     string     `json:"tunnel_id"`
 	Status       string     `json:"status"`
@@ -37,6 +40,7 @@ type TunnelResponse struct {
 	FRP          *FRPConfig `json:"frp,omitempty"`
 }
 
+// FRPConfig contains the issued frpc configuration for a new tunnel.
 type FRPConfig struct {
 	ServerAddr  string `json:"server_addr"`
 	ServerPort  int    `json:"server_port"`
@@ -48,6 +52,7 @@ type FRPConfig struct {
 	LocalPort   int    `json:"local_port"`
 }
 
+// RegisterRoutes mounts the owner and administrator tunnel routes.
 func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, cfg *config.Config) {
 	r.Post("/tunnels", CreateTunnel(pool, cfg))
 	r.Get("/tunnels", ListTunnels(pool, cfg))
@@ -60,6 +65,7 @@ func RegisterRoutes(r chi.Router, pool *pgxpool.Pool, cfg *config.Config) {
 	})
 }
 
+// CreateTunnel validates, allocates, and returns a new HTTP tunnel.
 func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := api.UserIDFromContext(r.Context())
@@ -69,13 +75,24 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 		}
 
 		var req CreateTunnelRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
 			var maxBytesErr *http.MaxBytesError
 			if errors.As(err, &maxBytesErr) {
 				api.WriteError(w, http.StatusRequestEntityTooLarge, api.ErrInvalidRequest, "request body too large")
 				return
 			}
 			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				api.WriteError(w, http.StatusRequestEntityTooLarge, api.ErrInvalidRequest, "request body too large")
+				return
+			}
+			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "request body must contain one JSON object")
 			return
 		}
 
@@ -91,7 +108,7 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			req.LocalHost = "127.0.0.1"
 		}
 		if req.LocalHost != "127.0.0.1" && req.LocalHost != "localhost" {
-			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "local_host must be 127.0.0.1")
+			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, "local_host must be 127.0.0.1 or localhost")
 			return
 		}
 
@@ -100,50 +117,14 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 		if req.TTLSeconds == 0 {
-			req.TTLSeconds = 3600
+			defaultTTL := time.Hour
+			if cfg.MaxTTL < defaultTTL {
+				defaultTTL = cfg.MaxTTL
+			}
+			req.TTLSeconds = int(defaultTTL / time.Second)
 		}
 		if int64(req.TTLSeconds) > int64(cfg.MaxTTL/time.Second) {
 			api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, fmt.Sprintf("ttl exceeds maximum of %s", cfg.MaxTTL))
-			return
-		}
-		ttl := time.Duration(req.TTLSeconds) * time.Second
-
-		// Check concurrent tunnel quota
-		count, err := CountActiveTunnels(r.Context(), pool, userID)
-		if err != nil {
-			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "quota check failed")
-			return
-		}
-		if count >= cfg.MaxConcurrent {
-			api.WriteError(w, http.StatusForbidden, api.ErrQuotaExceeded, fmt.Sprintf("maximum %d concurrent tunnels", cfg.MaxConcurrent))
-			return
-		}
-
-		// Generate tunnel ID with uniqueness retry. 80 bits of entropy makes a
-		// real collision absurdly unlikely; the loop is here to make the
-		// happy path bulletproof. Surface DB errors immediately rather than
-		// looping over them and reporting "failed to generate unique ID".
-		tunnelID := ""
-		for range 3 {
-			candidate, err := GenerateTunnelID()
-			if err != nil {
-				slog.Error("tunnel ID generation failed", "error", err)
-				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to generate tunnel ID")
-				return
-			}
-			var exists bool
-			if err := pool.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM tunnels WHERE id = $1)", candidate).Scan(&exists); err != nil {
-				slog.Error("tunnel ID uniqueness check failed", "error", err)
-				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "uniqueness check failed")
-				return
-			}
-			if !exists {
-				tunnelID = candidate
-				break
-			}
-		}
-		if tunnelID == "" {
-			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to generate unique tunnel ID")
 			return
 		}
 
@@ -154,8 +135,6 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		expiresAt := time.Now().Add(ttl)
-
 		tx, err := pool.Begin(r.Context())
 		if err != nil {
 			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
@@ -163,12 +142,58 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 		}
 		defer func() { _ = tx.Rollback(r.Context()) }()
 
-		_, err = tx.Exec(r.Context(),
-			"INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at) VALUES ($1, $2, $3, $4, $5, 'reserved', $6)",
-			tunnelID, userID, req.Type, req.LocalHost, req.LocalPort, expiresAt,
-		)
+		// Serialize creates for one user while checking and consuming quota.
+		// Without this transaction-scoped advisory lock, simultaneous requests
+		// can all observe the same count and exceed MaxConcurrent.
+		if _, err := tx.Exec(r.Context(), "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", userID); err != nil {
+			slog.Error("quota lock failed", "error", err, "user_id", userID)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "quota check failed")
+			return
+		}
+
+		count, err := CountNonTerminalTunnels(r.Context(), tx, userID)
 		if err != nil {
-			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "quota check failed")
+			return
+		}
+		if count >= cfg.MaxConcurrent {
+			api.WriteError(w, http.StatusForbidden, api.ErrQuotaExceeded, fmt.Sprintf("maximum %d concurrent tunnels", cfg.MaxConcurrent))
+			return
+		}
+
+		// Generate and insert in one statement. ON CONFLICT lets the
+		// transaction remain usable for the astronomically unlikely ID
+		// collision, so a fresh ID can be tried without a savepoint.
+		var (
+			tunnelID  string
+			expiresAt time.Time
+		)
+		for range 3 {
+			candidate, err := GenerateTunnelID()
+			if err != nil {
+				slog.Error("tunnel ID generation failed", "error", err)
+				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to generate tunnel ID")
+				return
+			}
+			err = tx.QueryRow(r.Context(),
+				`INSERT INTO tunnels (id, user_id, type, local_host, local_port, status, expires_at)
+				 VALUES ($1, $2, $3, $4, $5, 'reserved', statement_timestamp() + $6::bigint * interval '1 second')
+				 ON CONFLICT (id) DO NOTHING
+				 RETURNING expires_at`,
+				candidate, userID, req.Type, req.LocalHost, req.LocalPort, req.TTLSeconds,
+			).Scan(&expiresAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+				return
+			}
+			tunnelID = candidate
+			break
+		}
+		if tunnelID == "" {
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to generate unique tunnel ID")
 			return
 		}
 
@@ -181,8 +206,8 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		emitEvent(r.Context(), tx, tunnelID, "created", "reserved")
-		if err := tx.Commit(r.Context()); err != nil {
+		if err := insertEvent(r.Context(), tx, tunnelID, "created", "reserved"); err != nil {
+			slog.Error("create tunnel event failed", "error", err, "tunnel_id", tunnelID)
 			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
 			return
 		}
@@ -207,10 +232,35 @@ func CreateTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 				LocalPort:   req.LocalPort,
 			},
 		}
+		responseBody, err := json.Marshal(resp)
+		if err != nil {
+			slog.Error("create tunnel response marshal failed", "error", err, "tunnel_id", tunnelID)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			return
+		}
+		// Match json.Encoder's conventional trailing newline so an original
+		// response and an idempotency replay are byte-for-byte identical.
+		responseBody = append(responseBody, '\n')
+		if _, err := api.CompleteIdempotentResponseInTransaction(
+			r.Context(),
+			tx,
+			http.StatusCreated,
+			responseBody,
+		); err != nil {
+			slog.Error("complete create idempotency response failed", "error", err, "tunnel_id", tunnelID)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to create tunnel")
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		writeJSON(w, "create_tunnel", resp)
+		if _, err := w.Write(responseBody); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("response write failed", "op", "create_tunnel", "error", err)
+		}
 	}
 }
 
@@ -244,21 +294,25 @@ func decodeCursor(s string) (listCursor, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, fmt.Errorf("invalid cursor payload")
 	}
-	if c.TunnelID == "" {
+	if c.TunnelID == "" || c.CreatedAt.IsZero() {
 		return c, fmt.Errorf("invalid cursor")
 	}
 	return c, nil
 }
 
+// ListTunnels returns an owner-scoped, keyset-paginated tunnel list.
 func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := api.UserIDFromContext(r.Context())
 
 		limit := defaultListLimit
 		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= maxListLimit {
-				limit = n
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > maxListLimit {
+				api.WriteError(w, http.StatusBadRequest, api.ErrInvalidRequest, fmt.Sprintf("limit must be between 1 and %d", maxListLimit))
+				return
 			}
+			limit = n
 		}
 
 		cursor, err := decodeCursor(r.URL.Query().Get("cursor"))
@@ -267,11 +321,11 @@ func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
-		// Sentinel for the first page: 'infinity'::timestamptz is greater
-		// than any real created_at, and any string compares strictly less
-		// than the sentinel id, so `(created_at, id) < ($2, $3)` includes
-		// every row. One query handles both first-page and follow-on pages.
-		// Fetch limit+1 to detect a next page without a count query.
+		// Far-future and high-Unicode sentinels cover the application's
+		// timestamp and ASCII ID domains, so `(created_at, id) < ($2, $3)`
+		// includes every first-page row. One query handles both first-page
+		// and follow-on pages. Fetch limit+1 to detect a next page without
+		// a count query.
 		ts := cursor.CreatedAt
 		id := cursor.TunnelID
 		if id == "" {
@@ -309,6 +363,11 @@ func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 			e.t.PublicURL = publicURL(e.t.TunnelID, cfg.TunnelDomain)
 			entries = append(entries, e)
 		}
+		if err := rows.Err(); err != nil {
+			slog.Error("list tunnels iteration failed", "error", err)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
+			return
+		}
 
 		var nextCursor any
 		if len(entries) > limit {
@@ -330,6 +389,7 @@ func ListTunnels(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 	}
 }
 
+// GetTunnel returns one owner-scoped tunnel without creation credentials.
 func GetTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := api.UserIDFromContext(r.Context())
@@ -358,89 +418,53 @@ func GetTunnel(pool *pgxpool.Pool, cfg *config.Config) http.HandlerFunc {
 	}
 }
 
+// DeleteTunnel idempotently revokes an owner-scoped tunnel.
 func DeleteTunnel(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := api.UserIDFromContext(r.Context())
 		tunnelID := chi.URLParam(r, "id")
 
-		var owner, status string
-		err := pool.QueryRow(r.Context(),
-			"SELECT user_id, status FROM tunnels WHERE id = $1", tunnelID,
-		).Scan(&owner, &status)
+		found, err := Revoke(r.Context(), pool, tunnelID, userID)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
-			} else {
-				slog.Error("delete tunnel lookup failed", "error", err, "tunnel_id", tunnelID)
-				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
-			}
+			slog.Error("delete tunnel revoke failed", "error", err, "tunnel_id", tunnelID)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to revoke tunnel")
 			return
 		}
-		if owner != userID {
+		if !found {
 			api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
 			return
 		}
-
-		// Idempotent: DELETE on an already-terminal tunnel succeeds. Retries
-		// after a network blip shouldn't surface internal state-machine
-		// errors to the caller.
-		if status == "expired" || status == "revoked" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		if err := Transition(r.Context(), pool, tunnelID, EventRevoke); err != nil {
-			slog.Warn("delete tunnel transition", "tunnel_id", tunnelID, "error", err)
-			api.WriteError(w, http.StatusConflict, api.ErrInvalidRequest, "tunnel state changed concurrently")
-			return
-		}
-
-		revokeRuntimeTokens(r.Context(), pool, tunnelID)
-
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
+// AdminRevokeTunnel idempotently revokes a tunnel without an ownership filter.
 func AdminRevokeTunnel(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tunnelID := chi.URLParam(r, "id")
 
-		var status string
-		err := pool.QueryRow(r.Context(), "SELECT status FROM tunnels WHERE id = $1", tunnelID).Scan(&status)
+		found, err := Revoke(r.Context(), pool, tunnelID, "")
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
-			} else {
-				slog.Error("admin revoke lookup failed", "error", err, "tunnel_id", tunnelID)
-				api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "query failed")
-			}
+			slog.Error("admin revoke failed", "error", err, "tunnel_id", tunnelID)
+			api.WriteError(w, http.StatusInternalServerError, api.ErrInternal, "failed to revoke tunnel")
 			return
 		}
-
-		if status == "expired" || status == "revoked" {
-			w.WriteHeader(http.StatusNoContent)
+		if !found {
+			api.WriteError(w, http.StatusNotFound, api.ErrNotFound, "tunnel not found")
 			return
 		}
-
-		if err := Transition(r.Context(), pool, tunnelID, EventRevoke); err != nil {
-			slog.Warn("admin revoke transition", "tunnel_id", tunnelID, "error", err)
-			api.WriteError(w, http.StatusConflict, api.ErrInvalidRequest, "tunnel state changed concurrently")
-			return
-		}
-
-		revokeRuntimeTokens(r.Context(), pool, tunnelID)
-
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
-func revokeRuntimeTokens(ctx context.Context, pool *pgxpool.Pool, tunnelID string) {
-	if _, err := pool.Exec(ctx,
+func revokeRuntimeTokens(ctx context.Context, db eventExec, tunnelID string) error {
+	if _, err := db.Exec(ctx,
 		"UPDATE tunnel_runtime_tokens SET revoked_at = now() WHERE tunnel_id = $1 AND revoked_at IS NULL",
 		tunnelID,
-	); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("revoke runtime tokens failed", "tunnel_id", tunnelID, "error", err)
+	); err != nil {
+		return err
 	}
+	return nil
 }
 
 // writeJSON encodes v as JSON and logs an error if the encoder fails. Status

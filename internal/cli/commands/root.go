@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Execute builds and runs the Hatchway command tree.
 func Execute(version string) error {
 	root := &cobra.Command{
 		Use:   "hatchway",
@@ -28,6 +29,7 @@ func versionCmd(v string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print the version",
+		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Println(v)
 		},

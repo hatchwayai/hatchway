@@ -1,27 +1,47 @@
 # frps server — bundles frps binary with a templated Hatchway frps config.
 # Uses the official frp release rather than building from source.
 
-FROM alpine:3.19
+FROM alpine:3.22
 
-ARG FRP_VERSION=v0.68.1
-ARG TARGETARCH
+ARG FRP_VERSION=0.69.0
+ARG FRP_SHA256_AMD64=6b90d1cd28fc661f170c0de90dde03d2c63e4fd7ce0ae2da2ca1c28014b8146e
+ARG FRP_SHA256_ARM64=24a4fc82b4c041835103419685ea124c4d6a7dbf83d0425481c5831b4ce4b3a4
+ARG TARGETARCH=amd64
 
-RUN apk add --no-cache curl gettext && \
-    curl -fSL "https://github.com/fatedier/frp/releases/download/${FRP_VERSION}/frp_0.68.1_linux_${TARGETARCH}.tar.gz" \
-    | tar xz -C /tmp && \
-    mv /tmp/frp_0.68.1_linux_${TARGETARCH}/frps /usr/local/bin/frps && \
-    rm -rf /tmp/frp_* && \
-    apk del curl
+RUN set -eux; \
+    apk add --no-cache ca-certificates gettext; \
+    apk add --no-cache --virtual .fetch-deps curl; \
+    case "${TARGETARCH}" in \
+        amd64) checksum="${FRP_SHA256_AMD64}" ;; \
+        arm64) checksum="${FRP_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    archive="frp_${FRP_VERSION}_linux_${TARGETARCH}.tar.gz"; \
+    curl -fSL --retry 3 --retry-all-errors --connect-timeout 10 \
+        -o "/tmp/${archive}" \
+        "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${archive}"; \
+    echo "${checksum}  /tmp/${archive}" | sha256sum -c -; \
+    tar xzf "/tmp/${archive}" -C /tmp; \
+    mv "/tmp/frp_${FRP_VERSION}_linux_${TARGETARCH}/frps" /usr/local/bin/frps; \
+    rm -rf "/tmp/${archive}" "/tmp/frp_${FRP_VERSION}_linux_${TARGETARCH}"; \
+    apk del .fetch-deps
 
-COPY THIRD_PARTY_LICENSES /usr/local/share/licenses/frp/LICENSE
+COPY LICENSE /usr/local/share/licenses/hatchway/LICENSE
+COPY THIRD_PARTY_LICENSES /usr/local/share/licenses/hatchway/THIRD_PARTY_LICENSES
 COPY frps.toml.tmpl /etc/frp/frps.toml.tmpl
 COPY scripts/frps-entrypoint.sh /usr/local/bin/frps-entrypoint.sh
 RUN chmod +x /usr/local/bin/frps-entrypoint.sh
 
-RUN adduser -D -H frps && \
-    mkdir -p /var/run/frps && chown frps /var/run/frps
+RUN addgroup -S -g 10001 frps && \
+    adduser -S -D -H -u 10001 -G frps frps && \
+    mkdir -p /var/run/frps && \
+    chown frps:frps /var/run/frps && \
+    chmod 0700 /var/run/frps
 USER frps
 
 EXPOSE 7000 8081
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
+    CMD pidof frps >/dev/null && frps verify -c /var/run/frps/frps.toml >/dev/null
 
 ENTRYPOINT ["/usr/local/bin/frps-entrypoint.sh"]

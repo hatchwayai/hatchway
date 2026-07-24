@@ -2,13 +2,16 @@ package plugin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zydo/hatchway/internal/config"
@@ -26,14 +29,14 @@ type MetricsIncrFunc func(op string)
 // Passed in to avoid an import cycle on the api package.
 type DeadlineMetricFunc func()
 
-// frp plugin protocol types
-
+// PluginRequest is the envelope sent by the frps HTTP plugin protocol.
 type PluginRequest struct {
 	Version string          `json:"version"`
 	Op      string          `json:"op"`
 	Content json.RawMessage `json:"content"`
 }
 
+// PluginResponse is the allow/reject envelope expected by frps.
 type PluginResponse struct {
 	Reject       bool            `json:"reject"`
 	RejectReason string          `json:"reject_reason,omitempty"`
@@ -49,8 +52,7 @@ func allowUnchange() PluginResponse {
 	return PluginResponse{Reject: false, Unchange: true}
 }
 
-// Login content
-
+// LoginContent is the frps Login callback payload.
 type LoginContent struct {
 	Version       string            `json:"version"`
 	Hostname      string            `json:"hostname"`
@@ -65,8 +67,7 @@ type LoginContent struct {
 	ClientAddress string            `json:"client_address"`
 }
 
-// NewProxy content
-
+// NewProxyContent is the frps NewProxy callback payload.
 type NewProxyContent struct {
 	User               NewProxyUser      `json:"user"`
 	ProxyName          string            `json:"proxy_name"`
@@ -90,21 +91,21 @@ type NewProxyContent struct {
 	Metas              map[string]string `json:"metas"`
 }
 
+// NewProxyUser contains the client identity and metadata copied into proxy
+// callbacks.
 type NewProxyUser struct {
 	User  string            `json:"user"`
 	Metas map[string]string `json:"metas"`
 	RunID string            `json:"run_id"`
 }
 
-// CloseProxy content
-
+// CloseProxyContent is the frps CloseProxy callback payload.
 type CloseProxyContent struct {
 	User      NewProxyUser `json:"user"`
 	ProxyName string       `json:"proxy_name"`
 }
 
-// NewUserConn content
-
+// NewUserConnContent is the frps NewUserConn callback payload.
 type NewUserConnContent struct {
 	User       NewProxyUser `json:"user"`
 	ProxyName  string       `json:"proxy_name"`
@@ -113,7 +114,6 @@ type NewUserConnContent struct {
 }
 
 // tokenInfo holds the result of a runtime token lookup.
-
 type tokenInfo struct {
 	tokenID  string
 	tunnelID string
@@ -128,6 +128,11 @@ func Handler(pool *pgxpool.Pool, cfg *config.Config, transitionFn TransitionFunc
 		timeout = 2 * time.Second
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writePluginResponse(w, reject("method not allowed"))
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		r = r.WithContext(ctx)
@@ -138,7 +143,7 @@ func Handler(pool *pgxpool.Pool, cfg *config.Config, transitionFn TransitionFunc
 			return
 		}
 
-		if r.PathValue("secret") != cfg.PluginSecret {
+		if !constantTimeEqual(r.PathValue("secret"), cfg.PluginSecret) {
 			writePluginResponse(w, reject("unauthorized"))
 			return
 		}
@@ -149,9 +154,19 @@ func Handler(pool *pgxpool.Pool, cfg *config.Config, transitionFn TransitionFunc
 			return
 		}
 
+		maxBodyBytes := cfg.MaxRequestBytes
+		if maxBodyBytes <= 0 {
+			maxBodyBytes = 64 * 1024
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		var req PluginRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
 			writePluginResponse(w, reject("invalid request body"))
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			writePluginResponse(w, reject("request body must contain one JSON object"))
 			return
 		}
 
@@ -191,6 +206,13 @@ func Handler(pool *pgxpool.Pool, cfg *config.Config, transitionFn TransitionFunc
 	}
 }
 
+func constantTimeEqual(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
 func writePluginResponse(w http.ResponseWriter, resp PluginResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -212,9 +234,12 @@ func handleLogin(ctx context.Context, pool *pgxpool.Pool, content json.RawMessag
 	info, err := lookupRuntimeToken(ctx, pool, rt)
 	if err != nil {
 		slog.Warn("login rejected: token lookup failed", "error", err)
-		return reject("invalid credentials")
+		return reject(runtimeTokenRejectReason(err))
 	}
 
+	// Usage telemetry is deliberately best-effort: authorization has already
+	// succeeded, and an accounting write must not turn a valid frps login into
+	// an outage.
 	if _, err := pool.Exec(ctx,
 		"UPDATE tunnel_runtime_tokens SET last_used_at = now(), use_count = use_count + 1 WHERE id = $1",
 		info.tokenID,
@@ -240,11 +265,19 @@ func handleNewProxy(ctx context.Context, pool *pgxpool.Pool, transitionFn Transi
 	if rt == "" {
 		return reject("missing runtime token")
 	}
+	if np.ProxyType != "http" {
+		return reject("only http proxy type supported")
+	}
+	// Custom domains would bypass the tunnel_id→subdomain isolation enforced
+	// below, so the HTTP-only MVP rejects them before touching storage.
+	if len(np.CustomDomains) > 0 {
+		return reject("custom domains not supported")
+	}
 
 	info, err := lookupRuntimeToken(ctx, pool, rt)
 	if err != nil {
 		slog.Warn("newproxy rejected: token lookup failed", "error", err)
-		return reject("invalid credentials")
+		return reject(runtimeTokenRejectReason(err))
 	}
 
 	// proxy_name must equal tunnel_id
@@ -252,33 +285,13 @@ func handleNewProxy(ctx context.Context, pool *pgxpool.Pool, transitionFn Transi
 		return reject("proxy name mismatch")
 	}
 
-	// proxy_type must be http in MVP
-	if np.ProxyType != "http" {
-		return reject("only http proxy type supported")
-	}
-
-	// subdomain must equal tunnel_id; custom_domains are not allowed in MVP
-	// because they bypass the tunnel_id→subdomain isolation that the plugin
-	// otherwise enforces.
+	// The subdomain is always the authenticated tunnel ID.
 	if np.Subdomain != info.tunnelID {
 		return reject("subdomain mismatch")
 	}
-	if len(np.CustomDomains) > 0 {
-		return reject("custom domains not supported")
-	}
 
-	// Check tunnel is not in a terminal state
-	var status string
-	err = pool.QueryRow(ctx, "SELECT status FROM tunnels WHERE id = $1", info.tunnelID).Scan(&status)
-	if err != nil {
-		return reject("tunnel not found")
-	}
-
-	if status == "expired" || status == "revoked" {
-		return reject("tunnel is " + status)
-	}
-
-	// Transition: reserved→active or closed→active
+	// lookupRuntimeToken already rejects terminal or elapsed tunnels.
+	// Transition takes a row lock and closes the race with expiry/revocation.
 	err = transitionFn(ctx, pool, info.tunnelID, "NewProxy")
 	if err != nil {
 		slog.Warn("newproxy transition failed", "tunnel_id", info.tunnelID, "error", err)
@@ -298,8 +311,14 @@ func handleCloseProxy(ctx context.Context, pool *pgxpool.Pool, transitionFn Tran
 	// Check current state before transitioning
 	var status string
 	err := pool.QueryRow(ctx, "SELECT status FROM tunnels WHERE id = $1", cp.ProxyName).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Unknown tunnel, just allow — don't block frps.
+		return allowUnchange()
+	}
 	if err != nil {
-		// Unknown tunnel, just allow — don't block frps
+		if !errors.Is(err, context.Canceled) {
+			slog.Warn("closeproxy status lookup failed", "tunnel_id", cp.ProxyName, "error", err)
+		}
 		return allowUnchange()
 	}
 
@@ -314,16 +333,28 @@ func handleCloseProxy(ctx context.Context, pool *pgxpool.Pool, transitionFn Tran
 }
 
 func handleNewUserConn(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, content json.RawMessage) PluginResponse {
-	if !cfg.LogUserConns {
-		return allowUnchange()
-	}
-
 	var uc NewUserConnContent
 	if err := json.Unmarshal(content, &uc); err != nil {
-		return allowUnchange()
+		return reject("invalid new user connection content")
+	}
+	if pool == nil || uc.ProxyName == "" {
+		return reject("tunnel unavailable")
 	}
 
-	emitConnEvent(ctx, pool, uc)
+	// frps does not emit this callback for every proxy type. When it does,
+	// apply the same database-clock check as the HTTP request gate.
+	allowed, err := tunnelAcceptsTraffic(ctx, pool, uc.ProxyName)
+	if err != nil {
+		slog.Warn("new user connection rejected: tunnel lookup failed", "tunnel_id", uc.ProxyName, "error", err)
+		return reject("tunnel unavailable")
+	}
+	if !allowed {
+		return reject("tunnel unavailable")
+	}
+
+	if cfg.LogUserConns {
+		emitConnEvent(ctx, pool, uc)
+	}
 	return allowUnchange()
 }
 
@@ -334,41 +365,70 @@ func lookupRuntimeToken(ctx context.Context, pool *pgxpool.Pool, rawToken string
 	}
 
 	// Multiple tokens may share a 12-char prefix; iterate candidates and let
-	// the hash compare decide which is the real match. Without this, a fresh
-	// token whose prefix happens to collide with an older one in the same
-	// table would be silently rejected.
+	// the hash compare decide which is the real match. Filter dead credentials
+	// and tunnels before doing any expensive legacy verification.
 	rows, err := pool.Query(ctx,
-		"SELECT id, tunnel_id, token_hash, expires_at, revoked_at FROM tunnel_runtime_tokens WHERE token_prefix = $1",
+		`SELECT rt.id, rt.tunnel_id, rt.token_hash
+		   FROM tunnel_runtime_tokens rt
+		   JOIN tunnels t ON t.id = rt.tunnel_id
+		  WHERE rt.token_prefix = $1
+		    AND rt.revoked_at IS NULL
+		    AND rt.expires_at > now()
+		    AND t.expires_at > now()
+		    AND t.status IN ('reserved', 'active', 'closed')
+		  ORDER BY (rt.token_hash LIKE 'sha256:%') DESC, rt.created_at DESC, rt.id`,
 		prefix,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	now := time.Now()
+	type candidate struct {
+		tokenID  string
+		tunnelID string
+		hash     string
+	}
+	var candidates []candidate
 	for rows.Next() {
-		var tokenID, tunnelID, storedHash string
-		var expiresAt time.Time
-		var revokedAt *time.Time
-		if err := rows.Scan(&tokenID, &tunnelID, &storedHash, &expiresAt, &revokedAt); err != nil {
+		var c candidate
+		if err := rows.Scan(&c.tokenID, &c.tunnelID, &c.hash); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		if !tokens.VerifyToken(rawToken, storedHash) {
-			continue
-		}
-		if revokedAt != nil {
-			return nil, fmt.Errorf("token revoked")
-		}
-		if now.After(expiresAt) {
-			return nil, fmt.Errorf("token expired")
-		}
-		return &tokenInfo{tokenID: tokenID, tunnelID: tunnelID}, nil
+		candidates = append(candidates, c)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, err
 	}
+	rows.Close()
+
+	// Release the query's pool connection before bounded legacy Argon work.
+	// Verify current hashes first so an unrelated legacy-prefix collision
+	// cannot consume scarce KDF capacity ahead of a valid current token.
+	for _, currentPass := range []bool{true, false} {
+		for _, c := range candidates {
+			if tokens.UsesCurrentHash(c.hash) != currentPass {
+				continue
+			}
+			matches, err := tokens.VerifyTokenContext(ctx, rawToken, c.hash)
+			if err != nil {
+				return nil, fmt.Errorf("verify runtime token: %w", err)
+			}
+			if matches {
+				return &tokenInfo{tokenID: c.tokenID, tunnelID: c.tunnelID}, nil
+			}
+		}
+	}
 	return nil, fmt.Errorf("no matching runtime token")
+}
+
+func runtimeTokenRejectReason(err error) string {
+	if errors.Is(err, tokens.ErrLegacyVerificationBusy) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return "authentication temporarily unavailable"
+	}
+	return "invalid credentials"
 }
 
 func emitConnEvent(ctx context.Context, pool *pgxpool.Pool, uc NewUserConnContent) {

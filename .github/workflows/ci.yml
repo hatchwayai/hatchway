@@ -6,36 +6,85 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
-
-      - name: Install golangci-lint
-        # Pinned: this repo's .golangci.yml uses the v1 config schema, which
-        # `@latest` will eventually resolve past (golangci-lint v2 changed
-        # the schema). Bump deliberately, not implicitly.
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
+          go-version-file: go.mod
 
       - name: Lint
         run: make lint
 
+      - name: Formatting
+        run: make fmt-check
+
+      - name: Documentation lint
+        run: make lint-docs
+
+      - name: Release configuration
+        run: make validate-release
+
       - name: Test
         run: make test-short
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       - name: Build
         run: make build
 
       - name: Fuzz (short)
-        run: go test ./internal/server/tunnels/ -run=^$ -fuzz=FuzzTunnelIDValidation -fuzztime=30s
+        run: go test ./internal/server/tunnels/ -run=^$ -fuzz=FuzzDecodeCursor -fuzztime=30s
+
+  containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HATCHWAY_DOMAIN: hatchway.test
+      POSTGRES_PASSWORD: test-password
+      HATCHWAY_PLUGIN_SECRET: test_plugin_secret_0123456789abcdef
+      HATCHWAY_FRPS_AUTH_TOKEN: test_frps_auth_token_0123456789abcd
+      # The provider validates token shape while loading the Caddyfile. This
+      # is a non-secret, syntactically valid 35-character legacy token.
+      CLOUDFLARE_API_TOKEN: "00000000000000000000000000000000000"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate Compose and shell configuration
+        run: make validate-config
+
+      - name: Build container images
+        run: docker compose build hatchway-server frps caddy
+
+      - name: Validate Caddy configuration
+        run: >-
+          docker compose run --rm --no-deps --entrypoint caddy caddy
+          validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Validate frps configuration
+        run: |
+          docker compose run --rm --no-deps --entrypoint /bin/sh frps -ec '
+            umask 077
+            envsubst '"'"'${HATCHWAY_PLUGIN_SECRET} ${HATCHWAY_TUNNEL_DOMAIN} ${HATCHWAY_FRPS_AUTH_TOKEN}'"'"' \
+              </etc/frp/frps.toml.tmpl >/tmp/frps.toml
+            frps verify -c /tmp/frps.toml
+          '
 
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16-alpine
@@ -52,24 +101,23 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
 
       - name: Migration test
         run: go test ./internal/db/ -v -count=1
         env:
-          DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
+          HATCHWAY_TEST_DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
 
       - name: Integration tests — server packages
         env:
-          DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
-        # -p 1 forces packages to run sequentially. The tunnels and plugin
-        # integration fixtures both do `DELETE FROM <all tables>` at setup —
-        # safe in isolation but a guaranteed FK-violation source if two
-        # packages run concurrently against the same Postgres.
+          HATCHWAY_TEST_DATABASE_URL: postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable
+        # -p 1 forces packages to run sequentially. Server integration
+        # fixtures clear shared tables at setup, which is safe in isolation
+        # but races if packages share one Postgres concurrently.
         run: go test -count=1 -p 1 -timeout 300s ./internal/server/...
 
       - name: Run migrations
@@ -80,14 +128,14 @@ jobs:
         # behind, so init needs --force every time CI runs this step.
         run: go run ./cmd/hatchway server init --force --yes
 
-      - name: Integration test — CRUD endpoints
+      - name: Integration test — server startup
         env:
           HATCHWAY_SERVER: http://localhost:9000
         run: |
           set -euo pipefail
           DATABASE_URL=postgres://hatchway:test_password@localhost:5432/hatchway_test?sslmode=disable \
-          HATCHWAY_PLUGIN_SECRET=test-secret \
-          HATCHWAY_FRPS_AUTH_TOKEN=test-frps-token \
+          HATCHWAY_PLUGIN_SECRET=test_plugin_secret_0123456789abcdef \
+          HATCHWAY_FRPS_AUTH_TOKEN=test_frps_auth_token_0123456789abcd \
           HATCHWAY_FRPS_DOMAIN=frps.test.local \
           HATCHWAY_TUNNEL_DOMAIN=tunnel.test.local \
           go run ./cmd/hatchway server run &
@@ -110,4 +158,4 @@ jobs:
           curl -sf http://localhost:9000/healthz
           curl -sf http://localhost:9000/readyz
 
-          echo "Integration health checks passed"
+          echo "Integration readiness checks passed"

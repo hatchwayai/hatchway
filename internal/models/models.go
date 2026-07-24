@@ -2,6 +2,7 @@ package models
 
 import "time"
 
+// User is the administrative representation of a Hatchway user.
 type User struct {
 	ID        string    `json:"id"`
 	Email     *string   `json:"email"`
@@ -10,6 +11,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// Tunnel is the persisted administrative representation of a tunnel.
 type Tunnel struct {
 	ID         string     `json:"id"`
 	UserID     string     `json:"user_id"`

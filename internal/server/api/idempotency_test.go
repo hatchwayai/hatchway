@@ -15,7 +15,7 @@ func TestIdempotencyMiddleware_NoKey(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{}`))
@@ -36,7 +36,7 @@ func TestIdempotencyMiddleware_NoTokenID(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{}`))
@@ -83,6 +83,27 @@ func TestRequestHashAndRestoreBody_Empty(t *testing.T) {
 	}
 	if hash == "" {
 		t.Error("expected hash for empty body")
+	}
+}
+
+func TestRequestHashIncludesMethodAndTarget(t *testing.T) {
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodDelete, "/v1/tunnels/t-one", nil),
+		httptest.NewRequest(http.MethodDelete, "/v1/tunnels/t-two", nil),
+		httptest.NewRequest(http.MethodPost, "/v1/tunnels/t-one", nil),
+		httptest.NewRequest(http.MethodDelete, "/v1/tunnels/t-one?force=true", nil),
+	}
+
+	seen := make(map[string]bool)
+	for _, request := range requests {
+		hash, err := requestHashAndRestoreBody(request)
+		if err != nil {
+			t.Fatalf("requestHashAndRestoreBody() error = %v", err)
+		}
+		if seen[hash] {
+			t.Fatalf("request %s %s produced duplicate hash %s", request.Method, request.URL, hash)
+		}
+		seen[hash] = true
 	}
 }
 
@@ -136,6 +157,14 @@ func TestCaptureResponse_DefaultStatus(t *testing.T) {
 	}
 }
 
+func TestCaptureResponse_DefaultStatusWithoutWrite(t *testing.T) {
+	inner := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	rec := captureResponse(inner, httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
+	if rec.status != http.StatusOK {
+		t.Errorf("expected implicit status 200, got %d", rec.status)
+	}
+}
+
 func TestResponseRecorder_OversizeSetsFlag(t *testing.T) {
 	w := httptest.NewRecorder()
 	rec := &responseRecorder{ResponseWriter: w, body: &bytes.Buffer{}}
@@ -184,7 +213,7 @@ func TestIdempotencyMiddleware_WithTokenID_NilPool(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 	})
 
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{}`))
@@ -208,7 +237,7 @@ func TestIdempotencyMiddleware_BodyTooLarge(t *testing.T) {
 		t.Fatal("handler should not run for an oversized idempotent request")
 	})
 
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{"too":"large"}`))
@@ -227,7 +256,7 @@ func TestIdempotencyMiddleware_IgnoresEmptyKey(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("POST", "/v1/tunnels", strings.NewReader(`{}`))
@@ -265,7 +294,7 @@ func TestIdempotencyMiddleware_GetSkipsMiddleware(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	// Pass nil pool — middleware must not touch it for GET, even with a key.
-	handler := IdempotencyMiddleware(nil)(inner)
+	handler := IdempotencyMiddleware(nil, "test-secret")(inner)
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/v1/tunnels", nil)
@@ -300,6 +329,19 @@ func TestResponseRecorder_HeaderThenWrite(t *testing.T) {
 	}
 }
 
+func TestResponseRecorder_IgnoresDuplicateHeader(t *testing.T) {
+	w := httptest.NewRecorder()
+	rec := &responseRecorder{ResponseWriter: w, body: &bytes.Buffer{}}
+	rec.WriteHeader(http.StatusCreated)
+	rec.WriteHeader(http.StatusTeapot)
+	if rec.status != http.StatusCreated {
+		t.Errorf("status = %d, want first status 201", rec.status)
+	}
+	if w.Code != http.StatusCreated {
+		t.Errorf("underlying status = %d, want 201", w.Code)
+	}
+}
+
 func TestReplayCachedResponse_Bytes(t *testing.T) {
 	w := httptest.NewRecorder()
 	replayCachedResponse(w, http.StatusTeapot, []byte("x"))
@@ -308,5 +350,42 @@ func TestReplayCachedResponse_Bytes(t *testing.T) {
 	}
 	if w.Body.String() != "x" {
 		t.Errorf("body = %q", w.Body.String())
+	}
+}
+
+func TestIdempotencyCodecRoundTripAndTamperDetection(t *testing.T) {
+	codec := newIdempotencyCodec("strong-test-secret")
+	plaintext := []byte(`{"runtime_token":"rt_secret"}`)
+	stored, err := codec.seal("token-id", "request-key", http.StatusCreated, plaintext)
+	if err != nil {
+		t.Fatalf("seal() error = %v", err)
+	}
+	if bytes.Contains(stored, []byte("rt_secret")) {
+		t.Fatal("encrypted cache entry contains plaintext token")
+	}
+
+	got, err := codec.open("token-id", "request-key", http.StatusCreated, stored)
+	if err != nil {
+		t.Fatalf("open() error = %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("open() = %q, want %q", got, plaintext)
+	}
+
+	stored[len(stored)-1] ^= 1
+	if _, err := codec.open("token-id", "request-key", http.StatusCreated, stored); err == nil {
+		t.Fatal("open() should reject tampered ciphertext")
+	}
+}
+
+func TestIdempotencyCodecReadsLegacyPlaintext(t *testing.T) {
+	codec := newIdempotencyCodec("test-secret")
+	legacy := []byte(`{"ok":true}`)
+	got, err := codec.open("token-id", "request-key", http.StatusOK, legacy)
+	if err != nil {
+		t.Fatalf("open() legacy error = %v", err)
+	}
+	if !bytes.Equal(got, legacy) {
+		t.Fatalf("open() legacy = %q, want %q", got, legacy)
 	}
 }

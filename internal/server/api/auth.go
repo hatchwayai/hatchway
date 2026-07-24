@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -20,9 +22,9 @@ type TokenCandidate struct {
 	IsAdmin bool
 }
 
-// TokenLookup returns all DB rows whose token_prefix matches. pgx.ErrNoRows
-// is treated by callers as "no candidates" (equivalent to an empty slice);
-// other errors are surfaced as 401 without leaking the internal reason.
+// TokenLookup returns all DB rows whose token_prefix matches. pgx.ErrNoRows is
+// treated by callers as "no candidates"; storage failures become a generic 503
+// response and are logged without leaking the internal reason to clients.
 type TokenLookup func(ctx context.Context, prefix string) ([]TokenCandidate, error)
 
 var (
@@ -32,11 +34,18 @@ var (
 	errTokenLookupFailed       = errors.New("token lookup failed")
 )
 
+// AuthMiddleware authenticates API bearer tokens and adds their identity to
+// the request context.
 func AuthMiddleware(lookup TokenLookup) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, errMsg := authenticateRequest(r, lookup)
 			if errMsg != nil {
+				if errors.Is(errMsg, errTokenLookupFailed) {
+					slog.Error("authentication lookup failed", "error", errMsg)
+					WriteError(w, http.StatusServiceUnavailable, ErrInternal, "authentication service unavailable")
+					return
+				}
 				WriteError(w, http.StatusUnauthorized, ErrUnauthenticated, errMsg.Error())
 				return
 			}
@@ -66,25 +75,39 @@ func authenticateRequest(r *http.Request, lookup TokenLookup) (context.Context, 
 		return nil, err
 	}
 
-	for _, c := range candidates {
-		if tokens.VerifyToken(raw, c.Hash) {
-			// Propagate the request's auth info up through the outer
-			// RequestLogMiddleware via the shared container, so request logs
-			// can include token_id even though the new ctx is only visible
-			// to handlers below this middleware.
-			if container, ok := r.Context().Value(authInfoCtxKey{}).(*authInfo); ok {
-				container.tokenID = c.TokenID
-				container.userID = c.UserID
-				container.isAdmin = c.IsAdmin
+	// Prefixes contain only a few random characters, so collisions are
+	// expected at scale. Verify constant-cost current hashes before legacy
+	// Argon rows; an unrelated legacy collision must not consume scarce KDF
+	// capacity or mask a valid current token.
+	for _, currentPass := range []bool{true, false} {
+		for _, c := range candidates {
+			if tokens.UsesCurrentHash(c.Hash) != currentPass {
+				continue
 			}
-			return ContextWithAdmin(r.Context(), c.TokenID, c.UserID, c.IsAdmin), nil
+			matches, err := tokens.VerifyTokenContext(r.Context(), raw, c.Hash)
+			if err != nil {
+				return nil, fmt.Errorf("%w: verify token: %w", errTokenLookupFailed, err)
+			}
+			if matches {
+				// Propagate the request's auth info up through the outer
+				// RequestLogMiddleware via the shared container, so request
+				// logs can include token_id even though the new ctx is only
+				// visible to handlers below this middleware.
+				if container, ok := r.Context().Value(authInfoCtxKey{}).(*authInfo); ok {
+					container.tokenID = c.TokenID
+					container.userID = c.UserID
+					container.isAdmin = c.IsAdmin
+				}
+				return ContextWithAdmin(r.Context(), c.TokenID, c.UserID, c.IsAdmin), nil
+			}
 		}
 	}
 	return nil, errInvalidToken
 }
 
-// AdminOnly wraps a handler so it only runs when the authenticated principal has is_admin=true.
-// Returns 403 FORBIDDEN otherwise. AuthMiddleware must be applied before this in the chain.
+// AdminOnly wraps a handler so it only runs when the authenticated principal
+// has is_admin=true. It returns 403 FORBIDDEN otherwise. AuthMiddleware must
+// be applied earlier in the middleware chain.
 func AdminOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !IsAdminFromContext(r.Context()) {
@@ -114,7 +137,7 @@ func lookupCandidates(ctx context.Context, lookup TokenLookup, prefix string) ([
 		return nil, errInvalidToken
 	}
 	if err != nil {
-		return nil, errTokenLookupFailed
+		return nil, fmt.Errorf("%w: %w", errTokenLookupFailed, err)
 	}
 	if len(candidates) == 0 {
 		return nil, errInvalidToken

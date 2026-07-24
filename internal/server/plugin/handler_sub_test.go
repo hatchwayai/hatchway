@@ -3,12 +3,14 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/zydo/hatchway/internal/config"
+	"github.com/zydo/hatchway/internal/tokens"
 )
 
 // --- Login tests ---
@@ -82,21 +84,9 @@ func TestHandleNewProxy_RejectsNonHTTP(t *testing.T) {
 		ProxyType: "tcp",
 		Subdomain: "t-abc",
 	})
-	// We never reach the lookup because the lookup with nil pool would panic;
-	// the proxy_type check fires first. Verify by intercepting panics: if no
-	// panic occurred, the non-http reject path ran.
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("expected non-http reject before DB hit; panicked instead: %v", r)
-		}
-	}()
-	// Use a stub lookup pool via direct call — handleNewProxy uses pool only
-	// when token check passes. Token check fires first and will hit nil pool
-	// only when prefix lookup runs. So pass a runtime token check shortcut
-	// by relying on the proxy_name mismatch path that runs after token check.
 	resp := handleNewProxy(context.TODO(), nil, nil, content)
-	if !resp.Reject {
-		t.Error("expected reject for non-http proxy type")
+	if !resp.Reject || resp.RejectReason != "only http proxy type supported" {
+		t.Errorf("expected non-http proxy rejection, got %+v", resp)
 	}
 }
 
@@ -128,19 +118,16 @@ func TestHandleCloseProxy_InvalidJSON(t *testing.T) {
 func TestHandleNewUserConn_Disabled(t *testing.T) {
 	cfg := &config.Config{LogUserConns: false}
 	resp := handleNewUserConn(context.TODO(), nil, cfg, nil)
-	if resp.Reject {
-		t.Error("should allow when logging disabled")
-	}
-	if !resp.Unchange {
-		t.Error("should be unchange when logging disabled")
+	if !resp.Reject {
+		t.Error("invalid callback must be rejected even when event logging is disabled")
 	}
 }
 
 func TestHandleNewUserConn_InvalidJSON(t *testing.T) {
 	cfg := &config.Config{LogUserConns: true}
 	resp := handleNewUserConn(context.TODO(), nil, cfg, json.RawMessage(`not json`))
-	if resp.Reject {
-		t.Error("should allow on invalid JSON (graceful)")
+	if !resp.Reject {
+		t.Error("invalid JSON should be rejected")
 	}
 }
 
@@ -152,8 +139,10 @@ func TestHandleNewUserConn_ValidButNilPool(t *testing.T) {
 		ProxyType:  "http",
 		RemoteAddr: "1.2.3.4:5678",
 	})
-	defer func() { _ = recover() }()
-	_ = handleNewUserConn(context.TODO(), nil, cfg, content)
+	resp := handleNewUserConn(context.TODO(), nil, cfg, content)
+	if !resp.Reject {
+		t.Error("nil storage should fail closed")
+	}
 }
 
 // --- PluginRequest deserialization ---
@@ -314,5 +303,16 @@ func TestWritePluginResponse(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if resp.Reject {
 		t.Error("should not reject")
+	}
+}
+
+func TestRuntimeTokenRejectReason(t *testing.T) {
+	for _, err := range []error{tokens.ErrLegacyVerificationBusy, context.DeadlineExceeded} {
+		if got := runtimeTokenRejectReason(err); got != "authentication temporarily unavailable" {
+			t.Errorf("runtimeTokenRejectReason(%v) = %q", err, got)
+		}
+	}
+	if got := runtimeTokenRejectReason(errors.New("bad token")); got != "invalid credentials" {
+		t.Errorf("invalid-token reason = %q", got)
 	}
 }

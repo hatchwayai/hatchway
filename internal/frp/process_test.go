@@ -76,6 +76,13 @@ func TestProcessWait(t *testing.T) {
 	}
 }
 
+func TestProcessWaitBeforeStartReturnsError(t *testing.T) {
+	p := NewProcess("test", "sleep", []string{"1"})
+	if err := p.Wait(); err == nil {
+		t.Fatal("Wait before Start should return an error")
+	}
+}
+
 func TestProcessWait_ReturnsExitError(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh not available")

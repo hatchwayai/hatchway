@@ -8,14 +8,17 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zydo/hatchway/internal/server/api"
 )
 
+// Event identifies a lifecycle transition trigger.
 type Event string
 
+// Lifecycle transition events.
 const (
 	EventNewProxy   Event = "NewProxy"
 	EventCloseProxy Event = "CloseProxy"
@@ -29,11 +32,57 @@ var validTransitions = map[string]map[Event]string{
 	"closed":   {EventNewProxy: "active", EventExpire: "expired", EventRevoke: "revoked"},
 }
 
+// Transition atomically validates and applies one tunnel state change and
+// records its event. Revocation is routed through Revoke so runtime
+// credentials cannot remain live after an EventRevoke transition.
 func Transition(ctx context.Context, pool *pgxpool.Pool, tunnelID string, event Event) error {
+	if event == EventRevoke {
+		found, err := Revoke(ctx, pool, tunnelID, "")
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("lookup tunnel %s: %w", tunnelID, pgx.ErrNoRows)
+		}
+		return nil
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tunnel transition: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	var currentStatus string
-	err := pool.QueryRow(ctx, "SELECT status FROM tunnels WHERE id = $1", tunnelID).Scan(&currentStatus)
+	err = tx.QueryRow(ctx, "SELECT status FROM tunnels WHERE id = $1 FOR UPDATE", tunnelID).Scan(&currentStatus)
 	if err != nil {
 		return fmt.Errorf("lookup tunnel %s: %w", tunnelID, err)
+	}
+
+	if event == EventNewProxy {
+		// now()/statement_timestamp() are fixed before a blocked row lock is
+		// acquired. Check the database wall clock in a second statement while
+		// holding the lock so a callback cannot activate an elapsed tunnel.
+		var withinTTL bool
+		if err := tx.QueryRow(ctx,
+			"SELECT COALESCE(expires_at > clock_timestamp(), false) FROM tunnels WHERE id = $1",
+			tunnelID,
+		).Scan(&withinTTL); err != nil {
+			return fmt.Errorf("check tunnel expiry: %w", err)
+		}
+		if !withinTTL {
+			return fmt.Errorf("tunnel %s has expired", tunnelID)
+		}
+
+		// A reconnect may arrive while the database still says active if frps
+		// restarted or its CloseProxy callback was lost. Accept it as an
+		// idempotent no-op rather than fabricating a duplicate transition.
+		if currentStatus == "active" {
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit idempotent tunnel activation: %w", err)
+			}
+			return nil
+		}
 	}
 
 	transitions, ok := validTransitions[currentStatus]
@@ -46,7 +95,7 @@ func Transition(ctx context.Context, pool *pgxpool.Pool, tunnelID string, event 
 		return fmt.Errorf("invalid transition: %s + %s", currentStatus, event)
 	}
 
-	tag, err := pool.Exec(ctx, "UPDATE tunnels SET status = $1 WHERE id = $2 AND status = $3", newStatus, tunnelID, currentStatus)
+	tag, err := tx.Exec(ctx, "UPDATE tunnels SET status = $1 WHERE id = $2 AND status = $3", newStatus, tunnelID, currentStatus)
 	if err != nil {
 		return fmt.Errorf("update tunnel status: %w", err)
 	}
@@ -54,30 +103,95 @@ func Transition(ctx context.Context, pool *pgxpool.Pool, tunnelID string, event 
 		return fmt.Errorf("tunnel %s status changed concurrently", tunnelID)
 	}
 
-	emitEvent(ctx, pool, tunnelID, string(event), newStatus)
+	if err := insertEvent(ctx, tx, tunnelID, string(event), newStatus); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit tunnel transition: %w", err)
+	}
+
 	api.GlobalMetrics.IncrTransition()
 	slog.Info("tunnel transition", "tunnel_id", tunnelID, "from", currentStatus, "to", newStatus, "event", event)
 	return nil
+}
+
+// Revoke atomically revokes a tunnel, its live runtime credentials, and its
+// lifecycle event. ownerID scopes the lookup when non-empty; an empty ownerID
+// is the administrator path. Terminal rows are successful no-ops apart from
+// repairing any still-live credentials left by an interrupted older release.
+// The boolean result is false when the tunnel does not exist in the requested
+// ownership scope.
+func Revoke(ctx context.Context, pool *pgxpool.Pool, tunnelID, ownerID string) (bool, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin tunnel revoke: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	query := "SELECT status FROM tunnels WHERE id = $1 FOR UPDATE"
+	args := []any{tunnelID}
+	if ownerID != "" {
+		query = "SELECT status FROM tunnels WHERE id = $1 AND user_id = $2 FOR UPDATE"
+		args = append(args, ownerID)
+	}
+
+	var currentStatus string
+	if err := tx.QueryRow(ctx, query, args...).Scan(&currentStatus); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("lookup tunnel for revoke: %w", err)
+	}
+
+	transitioned := false
+	if currentStatus != "expired" && currentStatus != "revoked" {
+		newStatus, ok := validTransitions[currentStatus][EventRevoke]
+		if !ok {
+			return false, fmt.Errorf("invalid revoke from state %s", currentStatus)
+		}
+		if _, err := tx.Exec(ctx, "UPDATE tunnels SET status = $1 WHERE id = $2", newStatus, tunnelID); err != nil {
+			return false, fmt.Errorf("update tunnel status for revoke: %w", err)
+		}
+		if err := insertEvent(ctx, tx, tunnelID, string(EventRevoke), newStatus); err != nil {
+			return false, err
+		}
+		transitioned = true
+	}
+
+	if err := revokeRuntimeTokens(ctx, tx, tunnelID); err != nil {
+		return false, fmt.Errorf("revoke runtime tokens: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit tunnel revoke: %w", err)
+	}
+
+	if transitioned {
+		api.GlobalMetrics.IncrTransition()
+		slog.Info("tunnel transition", "tunnel_id", tunnelID, "from", currentStatus, "to", "revoked", "event", EventRevoke)
+	}
+	return true, nil
 }
 
 type eventExec interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
-func emitEvent(ctx context.Context, db eventExec, tunnelID, eventType, newStatus string) {
+func insertEvent(ctx context.Context, db eventExec, tunnelID, eventType, newStatus string) error {
 	payload, err := json.Marshal(map[string]string{"new_status": newStatus})
 	if err != nil {
-		slog.Error("marshal tunnel event payload failed", "tunnel_id", tunnelID, "error", err)
-		return
+		return fmt.Errorf("marshal tunnel event payload: %w", err)
 	}
 	if _, err := db.Exec(ctx,
 		"INSERT INTO tunnel_events (tunnel_id, event_type, payload) VALUES ($1, $2, $3)",
 		tunnelID, eventType, payload,
-	); err != nil && !errors.Is(err, context.Canceled) {
-		slog.Error("emit tunnel event failed", "tunnel_id", tunnelID, "event", eventType, "error", err)
+	); err != nil {
+		return fmt.Errorf("insert tunnel event: %w", err)
 	}
+	return nil
 }
 
+// StartReaper starts a background loop that expires elapsed non-terminal
+// tunnels until ctx is canceled.
 func StartReaper(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -94,10 +208,17 @@ func StartReaper(ctx context.Context, pool *pgxpool.Pool, interval time.Duration
 }
 
 func reapExpired(ctx context.Context, pool *pgxpool.Pool) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		slog.Error("reaper transaction failed", "error", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// RETURNING gives us per-row IDs so we can emit one Expire event per
 	// tunnel — bulk UPDATE alone wipes the audit trail for the only state
 	// transition users can't trigger themselves.
-	rows, err := pool.Query(ctx,
+	rows, err := tx.Query(ctx,
 		`UPDATE tunnels SET status = 'expired'
 		  WHERE expires_at < now() AND status IN ('reserved','active','closed')
 		  RETURNING id`,
@@ -106,23 +227,35 @@ func reapExpired(ctx context.Context, pool *pgxpool.Pool) {
 		slog.Error("reaper failed", "error", err)
 		return
 	}
-	defer rows.Close()
 
 	var expired []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			slog.Error("reaper scan failed", "error", err)
-			continue
+			rows.Close()
+			return
 		}
 		expired = append(expired, id)
 	}
 	if err := rows.Err(); err != nil {
 		slog.Error("reaper iterate failed", "error", err)
+		rows.Close()
+		return
 	}
+	rows.Close()
 
 	for _, id := range expired {
-		emitEvent(ctx, pool, id, string(EventExpire), "expired")
+		if err := insertEvent(ctx, tx, id, string(EventExpire), "expired"); err != nil {
+			slog.Error("reaper event failed", "tunnel_id", id, "error", err)
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("reaper commit failed", "error", err)
+		return
+	}
+	for range expired {
 		api.GlobalMetrics.IncrTransition()
 	}
 	if len(expired) > 0 {
@@ -130,9 +263,14 @@ func reapExpired(ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
-func CountActiveTunnels(ctx context.Context, pool *pgxpool.Pool, userID string) (int, error) {
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// CountNonTerminalTunnels returns the quota-consuming tunnel count for a user.
+func CountNonTerminalTunnels(ctx context.Context, db rowQuerier, userID string) (int, error) {
 	var count int
-	err := pool.QueryRow(ctx,
+	err := db.QueryRow(ctx,
 		"SELECT COUNT(*) FROM tunnels WHERE user_id = $1 AND status IN ('reserved','active','closed')",
 		userID,
 	).Scan(&count)

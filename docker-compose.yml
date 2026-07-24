@@ -5,13 +5,20 @@
 #   2. Run: docker compose up -d
 #   3. Bootstrap: docker compose run --rm hatchway-server server init
 #
-# The plugin port (9001) is intentionally NOT published — it is only
-# reachable on the hatchway_internal network.
+# The internal control port (9001) is intentionally NOT published — it is
+# only reachable on the hatchway_internal network.
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    stop_grace_period: 30s
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-hatchway}
       POSTGRES_USER: ${POSTGRES_USER:-hatchway}
@@ -19,23 +26,24 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      - hatchway_internal
+      - hatchway_database
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hatchway}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hatchway} -d ${POSTGRES_DB:-hatchway}"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 10s
+    logging: *default-logging
 
   hatchway-server:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    stop_grace_period: 35s
     command: ["server", "run"]
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-hatchway}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hatchway}?sslmode=disable
-      HATCHWAY_DOMAIN: ${HATCHWAY_DOMAIN:?Set HATCHWAY_DOMAIN in .env}
-      HATCHWAY_API_DOMAIN: ${HATCHWAY_API_DOMAIN:-api.${HATCHWAY_DOMAIN}}
       HATCHWAY_FRPS_DOMAIN: ${HATCHWAY_FRPS_DOMAIN:-frps.${HATCHWAY_DOMAIN}}
       HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
       HATCHWAY_API_ADDR: ":9000"
@@ -44,39 +52,74 @@ services:
       HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN:?Set HATCHWAY_FRPS_AUTH_TOKEN in .env}
       HATCHWAY_MAX_CONCURRENT_TUNNELS: ${HATCHWAY_MAX_CONCURRENT_TUNNELS:-5}
       HATCHWAY_MAX_TTL: ${HATCHWAY_MAX_TTL:-24h}
+      HATCHWAY_RATE_CREATE_PER_MIN: ${HATCHWAY_RATE_CREATE_PER_MIN:-10}
+      HATCHWAY_MAX_REQUEST_BYTES: ${HATCHWAY_MAX_REQUEST_BYTES:-65536}
+      HATCHWAY_API_READ_TIMEOUT: ${HATCHWAY_API_READ_TIMEOUT:-30s}
+      HATCHWAY_API_WRITE_TIMEOUT: ${HATCHWAY_API_WRITE_TIMEOUT:-30s}
+      HATCHWAY_PLUGIN_TIMEOUT: ${HATCHWAY_PLUGIN_TIMEOUT:-2s}
+      HATCHWAY_LOG_USER_CONNS: ${HATCHWAY_LOG_USER_CONNS:-false}
+      HATCHWAY_EVENTS_RETENTION_DAYS: ${HATCHWAY_EVENTS_RETENTION_DAYS:-30}
+      HATCHWAY_IDEMPOTENCY_RETENTION_HOURS: ${HATCHWAY_IDEMPOTENCY_RETENTION_HOURS:-24}
+      HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS: ${HATCHWAY_RUNTIME_TOKEN_RETENTION_DAYS:-7}
     depends_on:
       postgres:
         condition: service_healthy
+        restart: true
     networks:
+      - hatchway_database
       - hatchway_internal
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    logging: *default-logging
 
   frps:
     build:
       context: .
       dockerfile: Dockerfile.frps
     restart: unless-stopped
+    stop_grace_period: 15s
     environment:
       HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET:?Set HATCHWAY_PLUGIN_SECRET in .env}
       HATCHWAY_FRPS_AUTH_TOKEN: ${HATCHWAY_FRPS_AUTH_TOKEN:?Set HATCHWAY_FRPS_AUTH_TOKEN in .env}
       HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
     ports:
       - "7000:7000"
-      - "8081:8081"
     networks:
       - hatchway_internal
     depends_on:
-      - hatchway-server
+      hatchway-server:
+        condition: service_healthy
+        restart: true
+    read_only: true
+    tmpfs:
+      - /var/run/frps:rw,noexec,nosuid,nodev,mode=0700,uid=10001,gid=10001
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    logging: *default-logging
 
   caddy:
     build:
       context: .
       dockerfile: Dockerfile.caddy
     restart: unless-stopped
+    stop_grace_period: 15s
     environment:
       # Caddyfile reads {$HATCHWAY_API_DOMAIN} and {$HATCHWAY_TUNNEL_DOMAIN}
       # at startup; if either is empty Caddy fails to parse the site blocks.
       HATCHWAY_API_DOMAIN: ${HATCHWAY_API_DOMAIN:-api.${HATCHWAY_DOMAIN}}
       HATCHWAY_TUNNEL_DOMAIN: ${HATCHWAY_TUNNEL_DOMAIN:-tunnel.${HATCHWAY_DOMAIN}}
+      # Used only in Caddy's internal authorization subrequest path.
+      HATCHWAY_PLUGIN_SECRET: ${HATCHWAY_PLUGIN_SECRET:?Set HATCHWAY_PLUGIN_SECRET in .env}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?Set CLOUDFLARE_API_TOKEN in .env}
     ports:
       - "80:80"
@@ -88,8 +131,29 @@ services:
     networks:
       - hatchway_internal
     depends_on:
-      - hatchway-server
-      - frps
+      hatchway-server:
+        condition: service_healthy
+        restart: true
+      frps:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:2019/config/ && wget -q -T 3 -O /dev/null http://hatchway-server:9000/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: 256
+    logging: *default-logging
 
 volumes:
   postgres_data:
@@ -97,4 +161,7 @@ volumes:
   caddy_config:
 
 networks:
+  # Only PostgreSQL and Hatchway join this isolated backend segment.
+  hatchway_database:
+    internal: true
   hatchway_internal:

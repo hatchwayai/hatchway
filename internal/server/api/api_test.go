@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/zydo/hatchway/internal/config"
 	"github.com/zydo/hatchway/internal/tokens"
 )
 
@@ -68,6 +69,38 @@ func TestReadyzHandler_Unhealthy(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("expected 503, got %d", w.Code)
+	}
+}
+
+func TestRouterUsesJSONForRoutingErrors(t *testing.T) {
+	router := NewRouter(nil, &config.Config{})
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		status int
+		code   ErrorCode
+	}{
+		{"not found", http.MethodGet, "/missing", http.StatusNotFound, ErrNotFound},
+		{"method not allowed", http.MethodPost, "/healthz", http.StatusMethodNotAllowed, ErrInvalidRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, nil))
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d", w.Code, tc.status)
+			}
+			var resp ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("response is not JSON: %v", err)
+			}
+			if resp.Error.Code != tc.code {
+				t.Errorf("code = %q, want %q", resp.Error.Code, tc.code)
+			}
+			if w.Header().Get("X-Request-ID") == "" {
+				t.Error("missing X-Request-ID")
+			}
+		})
 	}
 }
 
@@ -219,8 +252,8 @@ func TestAuthMiddleware_DBLookupError(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer "+tok.Raw)
 	handler.ServeHTTP(w, r)
 
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for DB error, got %d", w.Code)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for DB error, got %d", w.Code)
 	}
 }
 

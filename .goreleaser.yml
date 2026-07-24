@@ -4,7 +4,7 @@
 # Server binary is standalone (frps runs as a separate container).
 #
 # Prerequisites:
-#   1. Run scripts/download-frp.sh to populate dist/frp/
+#   1. Run scripts/download-frp.sh to populate .release/frp/
 #   2. goreleaser release --snapshot (local) or goreleaser release (CI)
 
 version: 2
@@ -13,6 +13,8 @@ builds:
   - id: hatchway
     main: ./cmd/hatchway
     binary: hatchway
+    env:
+      - CGO_ENABLED=0
     flags:
       - -trimpath
     ldflags:
@@ -26,27 +28,33 @@ builds:
 
 archives:
   - id: client
-    builds:
+    ids:
       - hatchway
     name_template: "hatchway_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
-      - src: dist/frp/frpc_{{ .Os }}_{{ .Arch }}
-        dst: frpc
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_LICENSES
+      - src: .release/frp/{{ .Os }}_{{ .Arch }}/frpc
+        dst: .
         strip_parent: true
     wrap_in_directory: true
 
   - id: server
-    builds:
+    ids:
       - hatchway
     name_template: "hatchway-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    files: []
+    files:
+      - LICENSE
+      - README.md
+      - THIRD_PARTY_LICENSES
     wrap_in_directory: true
 
 checksum:
   name_template: "checksums.txt"
 
 snapshot:
-  version_template: "{{ .Tag }}-next"
+  version_template: "{{ .Version }}-SNAPSHOT-{{ .ShortCommit }}"
 
 changelog:
   sort: asc

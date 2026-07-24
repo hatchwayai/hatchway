@@ -2,6 +2,7 @@ package db
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -38,28 +39,44 @@ func newMigrator(databaseURL string) (*migrate.Migrate, error) {
 	return m, nil
 }
 
-func RunMigrations(databaseURL string) error {
+func closeMigrator(m *migrate.Migrate) error {
+	sourceErr, databaseErr := m.Close()
+	return errors.Join(sourceErr, databaseErr)
+}
+
+// RunMigrations applies every pending embedded migration.
+func RunMigrations(databaseURL string) (returnErr error) {
 	m, err := newMigrator(databaseURL)
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() {
+		if err := closeMigrator(m); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close migrator: %w", err))
+		}
+	}()
 
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	return nil
 }
 
-func RunMigrationsDown(databaseURL string) error {
+// RunMigrationsDown rolls back every applied migration. It is intended for
+// migration verification and destructive development teardown.
+func RunMigrationsDown(databaseURL string) (returnErr error) {
 	m, err := newMigrator(databaseURL)
 	if err != nil {
 		return err
 	}
-	defer m.Close()
+	defer func() {
+		if err := closeMigrator(m); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("close migrator: %w", err))
+		}
+	}()
 
-	if err := m.Drop(); err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("drop migrations: %w", err)
+	if err := m.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("run down migrations: %w", err)
 	}
 	return nil
 }

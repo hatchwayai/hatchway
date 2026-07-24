@@ -24,8 +24,8 @@ spec, and almost every file makes more sense once you've skimmed them:
 Hatchway is a **control plane**; frp is the **data plane**. The Hatchway
 server owns Postgres rows for users, API tokens, tunnels, and per-tunnel
 runtime tokens. It exposes two HTTP listeners: a public REST API on `:9000`
-authenticated by `sk_live_…` tokens, and an internal `:9001` that frps calls
-back into to authorize each frpc login and proxy registration. The CLI
+authenticated by `sk_live_…` tokens, and an internal `:9001` used by frps
+registration callbacks, Caddy request authorization, and metrics. The CLI
 binary `hatchway` runs in both roles — `hatchway server run` boots the
 control plane, `hatchway http 3000` is a client that calls the API, writes a
 temporary `frpc.toml`, and spawns frpc as a subprocess. Tunnel state lives
@@ -34,8 +34,8 @@ in Postgres and transitions through a small state machine
 
 ## 2. Repo map
 
-```
-cmd/hatchway/main.go            entrypoint — 12 lines, calls commands.Execute
+```text
+cmd/hatchway/main.go            entrypoint, JSON logging, commands.Execute
 internal/
   cli/
     commands/                   Cobra command tree (BOTH server and client)
@@ -48,7 +48,7 @@ internal/
   db/
     db.go                       pgxpool wrapper, InTx, CheckSchema
     migrate.go                  golang-migrate embed.FS driver
-    migrations/0001…0004        schema, admin flag, idempotency tweaks
+    migrations/0001…0006        schema, indexes, and integrity constraints
   models/models.go              row structs (User, Tunnel, …)
   tokens/tokens.go              MintAPIToken / MintRuntimeToken / Verify
   server/
@@ -60,12 +60,14 @@ internal/
       idempotency.go            (token_id, key) reservation + reply cache
       ratelimit.go              in-memory per-token token bucket
       metrics.go                Prometheus counters, exposed on :9001/metrics
-      health.go                 /healthz, /readyz (DB ping)
+      health.go                 /healthz, /readyz (DB + schema check)
     tunnels/                    domain logic for tunnel CRUD + lifecycle
       handlers.go               POST/GET/LIST/DELETE /v1/tunnels handlers
       id.go                     GenerateTunnelID (Crockford alphabet)
       lifecycle.go              Transition(), reaper, sweepers
-    plugin/handler.go           /frp/plugin/{secret} — frps callbacks
+    plugin/
+      handler.go               /frp/plugin/{secret} — frps callbacks
+      authorize.go             Caddy's per-request wildcard tunnel gate
   frp/process.go                subprocess wrapper (start/stop/restart)
 Caddyfile, docker-compose.yml,
 Dockerfile*, frps.toml.tmpl     deployment artifacts (see docs/self-host.md)
@@ -76,10 +78,11 @@ Three rules will save you time:
 
 1. **`internal/server/api/` is plumbing only.** It doesn't know what a
    tunnel is. Anything tunnel-specific lives in `internal/server/tunnels/`.
-2. **Import cycles are broken by callback functions.** `plugin/handler.go`
-   takes a `TransitionFunc` parameter; `api/router.go` takes a
-   `PluginHandlerFactory`. Wiring happens in `cli/commands/server.go`
-   inside `serverRunCmd`. If you're hunting "who calls what", start there.
+2. **Import cycles are broken by injected handlers and callback functions.**
+   `plugin/handler.go` takes a `TransitionFunc`; `api.StartServer` receives
+   the constructed plugin and request-gate handlers. Wiring happens in
+   `cli/commands/server.go` inside `serverRunCmd`. If you're hunting "who
+   calls what", start there.
 3. **Everything under `internal/` is unimportable from outside the module.**
    See `docs/extending.md` — Hatchway is a service, not a Go library.
 
@@ -107,9 +110,10 @@ file is touched.
    in a temp dir (mode `0600`), then spawns `frpc -c <path>` via
    `exec.CommandContext`.
 6. Signal handling and frpc restart-with-backoff (up to
-   `maxFRPCRestarts = 3`) live in the same function. On SIGINT/SIGTERM the
-   `cleanup` closure cancels the frpc context and best-effort calls
-   `DELETE /v1/tunnels/{id}` with a 3 s timeout.
+   `maxFRPCRestarts = 3`) live in the same function. From the moment the
+   reservation exists, a deferred three-second cleanup revokes it on every
+   exit path: signal, normal frpc exit, configuration/start failure, or
+   exhausted restarts.
 
 ### 3b. Server side (control plane)
 
@@ -121,73 +125,106 @@ file is touched.
 2. `internal/server/api/router.go:NewRouter` builds the chi router. The
    middleware chain on `/v1` is (in order):
 
-   ```
-   RequestLogMiddleware       ← outermost (slog with trace_id, status, latency)
+   ```text
+   RequestLogMiddleware       ← outermost (slog with request_id, status, latency)
      MaxBodySize               ← per-route cap from cfg.MaxRequestBytes
-       AuthMiddleware          ← Bearer → token_prefix lookup → argon2id verify
+       AuthMiddleware          ← Bearer → prefix lookup → versioned digest verify
          RateLimitMiddleware   ← in-memory token bucket per token_id
-           IdempotencyMiddleware  ← (token_id, key) reservation, 4 KB cache cap
+           IdempotencyMiddleware  ← route-bound reservation, encrypted 4 KB cache
              handler
    ```
 
    The order matters: rate-limit before idempotency means a replay still
    counts against the bucket, and idempotency runs *after* auth so it can
-   key on `token_id`. `StartServer` also stands up the plugin listener on
-   `:9001` with two endpoints: `/frp/plugin/{secret}` and `/metrics`.
+   key on `token_id`. `StartServer` also stands up the internal listener on
+   `:9001` with `/frp/plugin/{secret}`,
+   `/internal/tunnels/authorize/{secret}`, and `/metrics`.
 
 3. `internal/server/tunnels/handlers.go:CreateTunnel` is the handler:
-   validate body → `CountActiveTunnels` quota check (`MaxConcurrent`) →
-   `GenerateTunnelID` with a 3-try uniqueness loop against the DB →
-   `tokens.MintRuntimeToken` → INSERT into `tunnels` (status=`reserved`)
-   and `tunnel_runtime_tokens` → emit `tunnel_events` → respond with the
-   shape DESIGN.md "Create Tunnel" documents. The bootstrap `auth.token`
-   secret returned as `frp.server_token` is `cfg.FRPSAuthToken` — read the
-   comments here for why that is **not** the same thing as
-   `cfg.PluginSecret`.
+   strictly decode and validate the body → choose a TTL (the lower of one hour
+   and `MaxTTL` when omitted) → mint a runtime token → begin a transaction →
+   take a per-user advisory lock → check the non-terminal quota → generate
+   and insert a unique tunnel ID → insert the runtime token and creation event
+   → store the encrypted idempotency response in the same transaction → commit
+   → respond with the shape DESIGN.md "Create Tunnel" documents.
+   The bootstrap `auth.token` secret returned as `frp.server_token` is
+   `cfg.FRPSAuthToken` — read the comments here for why that is **not** the
+   same thing as `cfg.PluginSecret`.
 
 4. `internal/server/api/idempotency.go` is worth reading as a unit. It uses
    Postgres `INSERT … ON CONFLICT DO NOTHING` as a one-row reservation
-   lock: the winner runs the handler and writes back `response_status` and
-   `response_body`; concurrent retries either replay the cached row, get a
-   `409` if the original is still in flight, or get a `409` for body
-   mismatch on the same key.
+   lock. The request fingerprint covers method, escaped path, raw query, and
+   body. For tunnel creation, the handler writes the AES-GCM-encrypted
+   `response_body` in its domain transaction so the runtime credential and its
+   replay copy commit atomically; concurrent retries either replay the cached row, get a
+   `409` if the original is still in flight, or get a `409` when the key is
+   reused for a different request.
 
 ### 3c. Data plane (frps → plugin callback)
 
-When frpc connects to frps, frps issues two HTTP callbacks to
-`/frp/plugin/{secret}` on `:9001`. `internal/server/plugin/handler.go`:
+As frpc connects, registers a proxy, serves connections, and disconnects,
+frps issues HTTP callbacks to `/frp/plugin/{secret}` on `:9001`.
+`internal/server/plugin/handler.go`:
 
-1. `Handler` (the factory) bakes in `cfg.PluginTimeout` and wraps every
-   request in a deadline context. The path secret check is the first gate
-   — it must match `cfg.PluginSecret` exactly.
+1. `Handler` accepts only POST, bakes in `cfg.PluginTimeout`,
+   bounds the request body, and wraps every request in a deadline context.
+   Before decoding the callback it compares the path secret with
+   `cfg.PluginSecret` in constant time.
 2. Dispatch by `?op=` query param:
-   - `Login` — parse `metas.runtime_token`, look it up by 12-char prefix
-     (multiple rows possible — iterate and call `tokens.VerifyToken` on
-     each), reject if revoked or expired, bump `last_used_at` and
-     `use_count`.
+   - `Login` — parse `metas.runtime_token`, materialize live candidates for
+     its 12-char prefix while also requiring a non-terminal, unelapsed tunnel,
+     release the database connection, then verify current hashes before
+     bounded legacy hashes. Usage timestamps/counters are best-effort
+     telemetry after acceptance. Saturated legacy verification rejects with a
+     temporary-unavailability reason; a fixed-cost Argon worker already
+     started may finish in the background after the callback deadline.
    - `NewProxy` — same lookup, then assert `proxy_name == tunnel_id`,
      `proxy_type == "http"`, `subdomain == tunnel_id`, no `custom_domains`,
-     tunnel not terminal. Then `transitionFn(…, "NewProxy")` —
-     `reserved → active` or `closed → active`.
+     and tunnel not terminal/elapsed. Then `transitionFn(…, "NewProxy")`
+     rechecks expiry under the row lock and performs `reserved → active` or
+     `closed → active`; an already-`active` reconnect is an event-free no-op.
    - `CloseProxy` — if currently `active`, transition to `closed`. Other
-     states are no-ops; never blocks frps.
-   - `NewUserConn` — gated by `HATCHWAY_LOG_USER_CONNS`; writes a
-     `tunnel_events` row.
+     states are no-ops; never blocks frps. The callback is asynchronous, so
+     `closed` is advisory and may reflect a replaced registration.
+   - `NewUserConn` — when frp emits it, rechecks routable (`active`/`closed`)
+     state and elapsed TTL. `HATCHWAY_LOG_USER_CONNS` controls whether an
+     accepted callback writes a `tunnel_events` row. frp v0.69 does not emit
+     this operation for HTTP proxies, so HTTP enforcement does not rely on it.
    - `Ping`, `NewWorkConn` — accept unchanged.
 
 Every rejection returns a generic reason; specific failure modes are only
-logged. This matters — it's the security boundary for tunnel ownership.
+logged. This matters — it's the registration boundary for tunnel ownership.
 
-### 3d. The state machine
+### 3d. HTTP request gate (Caddy → Hatchway)
+
+Before Caddy sends a wildcard HTTP request to frps, `forward_auth` overwrites
+`X-Hatchway-Tunnel-Host` with the original host and calls
+`plugin.TunnelAuthorizationHandler` on `:9001`. `authorize.go` extracts the
+single-label tunnel ID and asks PostgreSQL whether it is `active` or `closed`
+with `expires_at > now()`. Caddy continues only on `204`; malformed hosts,
+reserved/terminal or elapsed rows, lookup failures, and unknown tunnels fail
+closed. `closed` remains routable because frps can deliver an old asynchronous
+CloseProxy after its replacement NewProxy; frps itself has no route when the
+proxy is truly absent.
+
+This check is per HTTP request and is the mechanism that makes revocation and
+expiry immediate for already-registered HTTP proxies.
+
+### 3e. The state machine
 
 `internal/server/tunnels/lifecycle.go` is the **only** writer of
-`tunnels.status`. `validTransitions` is the whole table; everything goes
-through `Transition(ctx, pool, id, event)`. Read this map alongside the
+`tunnels.status`. `validTransitions` is the table of state-changing edges.
+Callback changes go through `Transition(ctx, pool, id, event)`, which also
+handles an already-active reconnect as a no-op; user/admin revocation goes
+through `Revoke`, and `Transition(EventRevoke)` delegates there so live
+runtime credentials change in the same transaction. The reaper performs its
+guarded bulk expiry in this file as well. Read these functions alongside the
 DESIGN.md "Tunnel Lifecycle" diagram — they must match.
 
 `StartReaper` ticks every 30 s and does the only transition users can't
 trigger: `… → expired`. It uses `RETURNING id` so it can emit one event per
-expired tunnel without an extra round-trip. `StartSweepers` runs hourly and
+expired tunnel without a second lookup; the status changes and events commit
+in one transaction. `StartSweepers` runs hourly and
 deletes `tunnel_events` older than `HATCHWAY_EVENTS_RETENTION_DAYS`,
 `idempotency_keys` older than `HATCHWAY_IDEMPOTENCY_RETENTION_HOURS`, and
 runtime tokens that are dead (revoked or past `expires_at`) and beyond
@@ -200,11 +237,14 @@ If you want to read every file once and have it stick, do it in this order
 
 1. `DESIGN.md` "Design Invariants" + "Tunnel Lifecycle" + "Token Model".
 2. `internal/db/migrations/0001_init.up.sql` — the schema is the spine of
-   the system. Open `0002`/`0003`/`0004` to see how it evolved.
+   the system. Read through `0006` to see how storage, replay, indexes, and
+   integrity constraints evolved.
 3. `internal/models/models.go` — the Go structs for those tables.
-4. `internal/tokens/tokens.go` — token format, argon2id PHC, legacy
-   fallback. This is security-critical; read the comments.
-5. `internal/server/tunnels/id.go` — Crockford alphabet, 80 bits.
+4. `internal/tokens/tokens.go` — token format, current versioned SHA-256
+   digest, and resource-bounded legacy Argon2id fallbacks. This is
+   security-critical; read the comments.
+5. `internal/server/tunnels/id.go` — 31-symbol Crockford-style alphabet,
+   about 79 bits.
 6. `internal/server/tunnels/lifecycle.go` — state machine + reaper +
    sweepers. The whole transition policy fits on one screen.
 7. `internal/server/api/auth.go` — token prefix lookup → hash verify →
@@ -230,10 +270,10 @@ If you want to read every file once and have it stick, do it in this order
 When you need to know "who passes X to Y", these are the seams:
 
 - **`cli/commands/server.go:serverRunCmd`** — builds the cancel context,
-  the DB pool, the `tunnelRoutes` chi registrar, and the
-  `pluginHandler` factory. Plumbs `tunnels.Transition` into the plugin
-  package as a `TransitionFunc` to break the import cycle (plugin can't
-  import tunnels; tunnels imports api).
+  the DB pool, the `tunnelRoutes` chi registrar, and the plugin/request-gate
+  handlers. Plumbs `tunnels.Transition` into the plugin package as a
+  `TransitionFunc` to break the import cycle (plugin can't import tunnels;
+  tunnels imports api).
 - **`server/api/router.go:NewRouter`** — defines middleware order and
   mounts `/v1/me`. Domain routes are added by registrars from
   `tunnels.RegisterRoutes`.
@@ -241,20 +281,20 @@ When you need to know "who passes X to Y", these are the seams:
   goroutines, a single `errCh`, graceful shutdown with 30 s deadline.
 - **`server/api/metrics.go`** — `GlobalMetrics` is a package-level var
   consumed by the plugin handler (via the `MetricsIncrFunc` parameter)
-  and by `lifecycle.Transition`. It is served on the plugin port
+  and by `lifecycle.Transition`. It is served on the internal port
   (`:9001/metrics`), which is internal-only.
 
-## 6. The two-token model in one place
+## 6. The credential model in one place
 
-This trips up every newcomer. Three secrets, three different lifetimes,
-three different consumers:
+This trips up every newcomer. Four credentials have distinct scopes,
+lifetimes, and consumers:
 
-| Secret                     | Env / source                    | Who holds it                   | Who validates it               | Lifetime                     |
-| -------------------------- | ------------------------------- | ------------------------------ | ------------------------------ | ---------------------------- |
-| `sk_live_…` API token      | minted by `server token create` | the user / their CLI           | `api/auth.go` middleware       | until revoked                |
-| `rt_…` runtime token       | minted by `POST /v1/tunnels`    | frpc via `metas.runtime_token` | `plugin/handler.go` lookup     | until tunnel expires/revokes |
-| `HATCHWAY_FRPS_AUTH_TOKEN` | operator env var                | frpc + frps as `auth.token`    | frps internally                | rotation only                |
-| `HATCHWAY_PLUGIN_SECRET`   | operator env var                | frps callback URL path         | `plugin/handler.go` path check | rotation only                |
+| Secret                     | Env / source                    | Who holds it                          | Who validates it           | Lifetime                     |
+| -------------------------- | ------------------------------- | ------------------------------------- | -------------------------- | ---------------------------- |
+| `sk_live_...` API token    | minted by `server token create` | the user / their CLI                  | `api/auth.go` middleware   | until revoked                |
+| `rt_...` runtime token     | minted by `POST /v1/tunnels`    | frpc via `metadatas.runtime_token`    | `plugin/handler.go` lookup | until tunnel expires/revokes |
+| `HATCHWAY_FRPS_AUTH_TOKEN` | operator env var                | frpc + frps as `auth.token`           | frps internally            | rotation only                |
+| `HATCHWAY_PLUGIN_SECRET`   | operator env var                | frps, Caddy, and Hatchway path config | plugin/gate path checks    | rotation only                |
 
 Crucially: the API response includes `frp.server_token` (the bootstrap
 secret) but **never** the plugin secret. See the comment in
@@ -272,8 +312,8 @@ as living documentation:
   `validTransitions` plus every invalid transition.
 - `internal/tokens/tokens_test.go` — round-trip + tampering + PHC vs legacy
   hash format.
-- `internal/server/tunnels/id_fuzz_test.go` — fuzz target on the tunnel-ID
-  parser; useful as a tour of the legality rules.
+- `internal/server/tunnels/cursor_fuzz_test.go` — fuzzes the actual opaque
+  pagination-cursor parser against arbitrary client input.
 
 ## 8. Deployment side, in one page
 
@@ -286,13 +326,14 @@ the short version is:
   `snowdreamtech/frps`), `caddy` (custom built with `xcaddy` + a DNS
   provider plugin for wildcard TLS).
 - `Caddyfile` reverse-proxies `api.example.com` to
-  `hatchway-server:9000` and `*.tunnel.example.com` to `frps:8081` (vhost
-  HTTP port). It must **not** route `:9001`.
+  `hatchway-server:9000`. For `*.tunnel.example.com`, it first makes an
+  internal authorization subrequest to Hatchway `:9001`, then proxies allowed
+  requests to `frps:8081`. It must never expose `:9001` publicly.
 - `frps.toml.tmpl` is rendered with `HATCHWAY_PLUGIN_SECRET` and
   `HATCHWAY_FRPS_AUTH_TOKEN` at container start. The `httpPlugins`
   section is what makes frps call back into `:9001`.
-- Client-side: `dist/hatchway-<os>-<arch>.tar.gz` ships the `hatchway`
-  binary alongside `frpc`. Goreleaser config in `.goreleaser.yml`.
+- Client-side: `.goreleaser.yml` is configured so future release archives
+  place `hatchway` beside `frpc`. No release artifact is currently published.
 
 ## 9. Common "where is …?" answers
 
@@ -303,8 +344,9 @@ the short version is:
   (base64-encoded `{created_at, tunnel_id}`).
 - **The 4 KB idempotency cap**: `server/api/idempotency.go:maxCachedBodySize`
   and the `responseRecorder` that enforces it.
-- **The argon2id parameters**: `internal/tokens/tokens.go` `argonTime`,
-  `argonMemory`, `argonThreads`, `argonKeyLen` constants.
+- **Current and legacy token verification**: `internal/tokens/tokens.go`
+  `sha256HashPrefix`, `legacyVerifySlots`, and the fixed `argon*` compatibility
+  constants.
 - **The 30 s graceful shutdown deadline**:
   `server/api/router.go:StartServer` (`context.WithTimeout(..., 30s)`).
 - **frpc restart cap**: `cli/commands/client.go:maxFRPCRestarts = 3`.
