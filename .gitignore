@@ -32,3 +32,7 @@ Thumbs.db
 *.test
 *.prof
 coverage.out
+
+# Local tooling & scratch (not for git)
+.claude/
+.localonly/
