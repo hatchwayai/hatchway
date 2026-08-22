@@ -11,15 +11,24 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 CLI-first, self-hosted public HTTP tunnels powered by [frp](https://github.com/fatedier/frp).
+The ngrok developer workflow — one command, public URL, done — on your own
+infrastructure, designed for scripts and AI agents.
 
 Hatchway is built for short-lived, scriptable workflows: expose a local HTTP
 service, get a URL on your own domain, and let the tunnel expire or revoke it
-when the work is done.
+when the work is done. JSON output, idempotent creation, per-tunnel scoped
+credentials, and server-enforced quotas make it safe to hand to automated
+clients.
 
 ```console
 $ hatchway http 3000
 https://t-abc3x7km9w2p4rng.tunnel.example.com
 ```
+
+**For AI agents:** [hatchway-skills](https://github.com/zydo/hatchway-skills)
+ships an [Agent Skills](https://agentskills.io) package that teaches Claude
+Code, Cursor, Codex, and other agents to use your tunnel server — webhook
+testing and dev-server sharing with no SaaS account in the loop.
 
 ## Who is this for?
 
@@ -27,6 +36,8 @@ Use Hatchway when you want:
 
 - an ngrok-like HTTP tunnel on infrastructure and DNS you control;
 - a CLI suitable for local development, CI, webhooks, and agent workflows;
+- an automation surface designed for non-humans: JSON output, stable error
+  codes, `Idempotency-Key` creation, and bounded quotas;
 - per-tunnel TTL and runtime credentials; and
 - per-user concurrent-tunnel quotas plus per-token creation rate limits.
 
@@ -201,9 +212,10 @@ recreate the `public` schema, so they deliberately ignore the service's
 `DATABASE_URL`. Run shared-database tests serially with
 `go test -p 1 ./...`.
 
-`make build` writes `dist/hatchway`; provide `frpc` separately. The GoReleaser
-configuration is prepared to place `hatchway` and `frpc` side by side in
-client archives, but this repository currently has no published release tag.
+`make build` writes `dist/hatchway`; provide `frpc` separately. Client release
+archives bundle `hatchway` and `frpc` side by side — `make validate-release`
+builds and verifies them locally, and published archives appear on the
+[releases page](https://github.com/zydo/hatchway/releases) (v0.1.0+).
 
 ## Documentation
 
@@ -212,6 +224,8 @@ client archives, but this repository currently has no published release tag.
 | [docs/self-host.md](docs/self-host.md) | Canonical operator setup and upgrade guide |
 | [docs/api.md](docs/api.md) | Implemented REST API contract |
 | [docs/cli.md](docs/cli.md) | Implemented client and server commands |
+| [docs/comparisons.md](docs/comparisons.md) | Hatchway vs frp, Pangolin, and managed tunnels |
+| [docs/security.md](docs/security.md) | Security model: credentials, gating, quotas, non-goals |
 | [DESIGN.md](DESIGN.md) | Current architecture, invariants, and future boundaries |
 | [PLAN.md](PLAN.md) | Historical roadmap and remaining release work |
 | [docs/source-reading-guide.md](docs/source-reading-guide.md) | Top-down code-reading path |
