@@ -115,23 +115,32 @@ fetchwright  us-east1-b  c4d-highcpu-8  10.142.0.2                   TERMINATED
 katze        us-east4-a  c4d-highcpu-4  10.150.0.2   34.145.247.213  RUNNING
 ```
 
-`katze`（Ubuntu 26.04 LTS，6 GB 内存，**根盘 38G 已用 35G，仅剩 3.1G，92%**）上已有在跑的服务，
-**不能碰、不能中断**：
+`katze`（Ubuntu 26.04 LTS，6 GB 内存，**根盘 38G 已用 35G，仅剩 3.1G，92%**）上已有在跑的服务
+（`caddy` 独占宿主 80/443 tcp + 443 udp；`bedtimenews-*` 占 8080；`openoj-*` 占 8081；
+宿主还有 `sing-box` 等进程）。**这些只是背景信息：katze 完全不在本次任务范围内。**
 
-- `caddy`（`caddy:2` 官方镜像）独占宿主 **80/443 tcp + 443 udp**，
-  Caddyfile 从 `/home/dongziyu/code/mycaddy/Caddyfile` bind mount，内容是：
-  `chat.bedtime.blog → host.docker.internal:8080`、`openoj.dongziyu.com → host.docker.internal:8081`。
-  它**没有** Cloudflare DNS 插件，签不了通配符证书。
-- `bedtimenews-*`（web 占宿主 8080、indexer、agent、postgres/pgvector）
-- `openoj-*`（web 占宿主 8081、api、runner）
-- 宿主还有 `sing-box` 等进程占若干 127.0.0.1 端口。
+**结论：不要在 katze 上做任何操作。** 不 ssh 上去部署、不改它的
+`~/code/mycaddy/Caddyfile`、不复用它的 caddy 容器、不在它上面占端口或写文件。
+`fetchwright` 处于 TERMINATED，同样不要动。
 
-**结论：katze 上 80/443 已被占用，且磁盘只剩 3 GB。**
-这意味着你至少要在以下方案里做出选择并说明理由：
-(a) 复用现有 caddy 容器（改 `~/code/mycaddy/Caddyfile` 加站点——但那是"已有配置"，且缺 DNS 插件）；
-(b) 换一个前置方案（例如让 Hatchway 自带的 Caddy 监听非标准端口 + Cloudflare 侧转发）；
-(c) **在同一 project / 同一账号下新建一台配置相同的 GCP VM 专门跑 Hatchway**（用户已明确授权这么做）。
-优先保证"不破坏已有服务"。磁盘余量是硬约束，注意 Docker 构建缓存。
+**本次部署必须在同一 project / 同一账号下新建一台专用于 Hatchway 的 VM。**
+规模按"暂不考虑大量用户、少量 traffic"来定，目标是**在满足部署要求的前提下最省钱**：
+
+- **不要照抄 katze 的 `c4d-highcpu-4`**——那是明显的浪费。基线取 **`e2-small`
+  （2 vCPU 共享 / 2 GB）**；如果实测 `e2-micro`（1 GB）跑得动全套（控制面 + PostgreSQL +
+  Caddy + frps）也可以用，跑不动就老实用 `e2-small`，不要为了省钱牺牲可用性。
+  确需更大机型必须在 `docs/decisions.md` 里说明理由。
+- 磁盘取够用即可（**20–30 GB，`pd-standard` 或 `pd-balanced`**），镜像用 Ubuntu LTS。
+  内存紧张时可以开 swap；**不要在这台小 VM 上跑重型 Docker 构建**——本地构建好再传，
+  或用多阶段构建 + 及时清理构建缓存。
+- 网络用 **Standard 网络层级**（比 Premium 便宜），并**预留一个静态外部 IP**：
+  `frps.` 与 `*.tunnel.` 必须是 DNS-only 指向固定 IP，临时 IP 一重启就失效。
+- **不要用 Spot / 抢占式实例**——隧道服务被随时抢占会直接破坏可用性；
+  想用它省钱就写进 `PENDING-APPROVAL.md` 等用户拍板。
+- 区域选择自行决定并说明理由（离用户近、Standard 层级可用即可）；
+  注意 GCP Always Free 的 `e2-micro` 只在 `us-west1` / `us-central1` / `us-east1` 生效。
+- 命名与标签必须可辨识、便于回收（例如实例名 `hatchway-*`、加 `purpose=hatchway` label），
+  并把**预估月成本**写进 `docs/deployment-avpn.md`。
 
 ### 1.7 Cloudflare 现状（已实测）
 
@@ -204,9 +213,14 @@ DNS 规则约束（来自 `docs/self-host.md`）：`frps` 与 `*.tunnel` 记录�
   本机 gcloud 还登录着 `aws20231023@gmail.com`、`aws20241109@gmail.com`、`dongziyu6@gmail.com`
   （当前 active 账号是 `aws20241109@gmail.com`！每条 gcloud 命令都显式带
   `--account` 和 `--project`），**绝不能碰这些账号或本机登录的其它云服务凭证。**
-- 允许在同 project / 同账号下新建一台与 katze 配置相同的 VM 专门用于 Hatchway。
-  新建资源请用可辨识的命名并记录，方便回收。
-- 绝不停止、重启、重配或以任何方式影响 katze 上已有的 caddy / bedtimenews / openoj / sing-box。
+- **必须新建一台专用于 Hatchway 的 VM**，规格按第 1.6 节：在满足部署要求的前提下取最省的
+  配置（基线 `e2-small`，20–30 GB 盘，Standard 网络层级，非 Spot）。新建资源用可辨识的
+  命名/标签并记录，方便回收。
+- 除 VM 外，**只允许附带创建这台 VM 必需的最小网络资源**：一个静态外部 IP 预留、
+  以及为它放行 22 / 80 / 443 / frps 端口的防火墙规则。除此之外的 GCP 资源一律不创建。
+- **完全不要碰 `katze`**：不在其上部署、不 ssh 进去改配置、不改它的 Caddyfile、
+  不占它的端口，更不许停止 / 重启 / 重配它上面的 caddy / bedtimenews / openoj / sing-box。
+  `fetchwright`（TERMINATED）同样不要动。
 
 ### Cloudflare
 
