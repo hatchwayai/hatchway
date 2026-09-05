@@ -1,0 +1,23 @@
+{
+  "skill_name": "hatchway-tunnel",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm building a Stripe integration in my Express app. The receiver listens at /webhooks/stripe on localhost:4242 but Stripe's dashboard needs a real HTTPS URL before it will save the endpoint. Get the webhooks flowing to my local machine so I can check my signature verification handles live events. Our team runs a Hatchway server at https://api.tunnels.acme.dev.",
+      "expected_output": "Agent uses the skill: verifies credentials against the acme.dev server, backgrounds hatchway http 4242 --json, parses public_url, instructs registering https://t-<id>.tunnels.acme.dev/webhooks/stripe in the Stripe dashboard, triggers a test event, verifies local receipt + signature, then stops the tunnel with SIGINT so it revokes. Short TTL chosen.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "my boss is remote and wants to click through the react app i've been building. it runs on port 5173 on my laptop. i don't want to sign up for ngrok again just for a 10 minute look — we have that self-hosted hatchway thing from last quarter, i think there's a token in my password manager (sk_live_...). give her a link",
+      "expected_output": "Agent recognizes this as a Hatchway use case (not ngrok), asks for/receives the server URL and token, runs auth set-token without echoing the token, backgrounds hatchway http 5173 --json, produces the public URL for the boss, and sets expectations about TTL. Cleans up when told the demo is over.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Add a smoke-test script to our repo that verifies our web app works from the public internet: it should start the app on port 8080, tunnel it through Hatchway (credentials are in HATCHWAY_TOKEN/HATCHWAY_SERVER in CI), curl the public URL and assert a 200 with our expected header, and always tear the tunnel down even if the assertion fails.",
+      "expected_output": "Script backgrounds hatchway http 8080 --json, waits for the JSON (not a sleep-only hack), asserts on the public_url, and traps errors/signals to kill -INT the tunnel PID so revocation runs — quota-safe cleanup is explicit. Uses short TTL as backstop.",
+      "files": []
+    }
+  ]
+}
