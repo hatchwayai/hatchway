@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/zydo/hatchway/internal/server/api"
+	"github.com/hatchwayai/hatchway/internal/server/api"
 )
 
 // Event identifies a lifecycle transition trigger.

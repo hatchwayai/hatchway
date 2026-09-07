@@ -8,7 +8,7 @@ come from the 2026-08-22 market research:
 ## Growth priorities
 
 - [ ] **Publish `hatchway-skills`** (the Agent Skill package is drafted; its
-  repo targets `github.com/zydo/hatchway-skills`)
+  repo targets `github.com/hatchwayai/hatchway-skills`)
   - [ ] Create the remote, make the first commit, and push (skill, reference
     doc, and staged eval prompts are ready)
   - [ ] Submit the skill to terminalskills.io (needs the public repo live)

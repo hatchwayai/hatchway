@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/zydo/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/config"
 )
 
 func authorizationMux(cfg *config.Config) http.Handler {

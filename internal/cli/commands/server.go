@@ -17,16 +17,16 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/db"
+	frp "github.com/hatchwayai/hatchway/internal/frp"
+	"github.com/hatchwayai/hatchway/internal/models"
+	"github.com/hatchwayai/hatchway/internal/server/api"
+	"github.com/hatchwayai/hatchway/internal/server/plugin"
+	"github.com/hatchwayai/hatchway/internal/server/tunnels"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/db"
-	frp "github.com/zydo/hatchway/internal/frp"
-	"github.com/zydo/hatchway/internal/models"
-	"github.com/zydo/hatchway/internal/server/api"
-	"github.com/zydo/hatchway/internal/server/plugin"
-	"github.com/zydo/hatchway/internal/server/tunnels"
-	"github.com/zydo/hatchway/internal/tokens"
 )
 
 const (

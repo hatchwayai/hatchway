@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/tokens"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 )
 
 // TransitionFunc is a callback that transitions a tunnel's state.

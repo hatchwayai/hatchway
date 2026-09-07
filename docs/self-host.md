@@ -46,7 +46,7 @@ record DNS-only as well. If the API record is proxied, select Cloudflare
 ## Configure
 
 ```bash
-git clone https://github.com/zydo/hatchway.git
+git clone https://github.com/hatchwayai/hatchway.git
 cd hatchway
 cp .env.example .env
 ```

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hatchwayai/hatchway/internal/tokens"
 	"github.com/jackc/pgx/v5"
-	"github.com/zydo/hatchway/internal/tokens"
 )
 
 // TokenCandidate is a single row matching a token prefix lookup. Multiple

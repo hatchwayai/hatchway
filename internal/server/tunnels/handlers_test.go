@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/server/api"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/server/api"
 )
 
 // --- CreateTunnel request validation tests (nil pool — validation happens before DB calls) ---

@@ -19,7 +19,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	cli "github.com/zydo/hatchway/internal/cli"
+	cli "github.com/hatchwayai/hatchway/internal/cli"
 )
 
 const maxFRPCRestarts = 3

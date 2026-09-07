@@ -46,7 +46,7 @@ https://t-abc3x7km9w2p4rng.tunnel.example.com
 
 ### 1.2 代码状态
 
-- Go 1.26.5 模块 `github.com/zydo/hatchway`，Cobra + chi + pgx/v5 + golang-migrate + slog。
+- Go 1.26.5 模块 `github.com/hatchwayai/hatchway`，Cobra + chi + pgx/v5 + golang-migrate + slog。
 - 单一二进制 `hatchway`，含客户端命令（`http`/`list`/`delete`/`auth`）与
   `server` 子命令树（`run`/`init`/`user`/`token`/`healthcheck`）。
 - 目录：`cmd/hatchway`、`internal/{config,db,models,tokens,cli,frp,testutil}`、
@@ -98,7 +98,7 @@ https://t-abc3x7km9w2p4rng.tunnel.example.com
 
 - 路径：本仓库内的 `hatchway-skills/`（原先是 `/Users/dongziyu/code/hatchway-skills`
   独立仓库，已并入本仓库；它自带的空 `.git` 已删除，自带的 `.gitignore` 保留）。
-  README 里仍写着 `github.com/zydo/hatchway-skills` 这个目标 remote，但**现在它不是独立
+  README 里仍写着 `github.com/hatchwayai/hatchway-skills` 这个目标 remote，但**现在它不是独立
   仓库了**——就地修改、随本仓库一起提交；README 里关于安装路径/仓库地址的说法如果因此
   过时，一并更新。
 - 内容：`skills/hatchway-tunnel/SKILL.md` + `references/REFERENCE.md`、`evals/evals.json`

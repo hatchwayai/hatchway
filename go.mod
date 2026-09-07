@@ -1,4 +1,4 @@
-module github.com/zydo/hatchway
+module github.com/hatchwayai/hatchway
 
 go 1.26.5
 

@@ -15,8 +15,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/db"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/db"
 )
 
 // RouteRegistrar mounts domain routes beneath /v1.

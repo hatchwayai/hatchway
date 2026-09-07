@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	cli "github.com/zydo/hatchway/internal/cli"
+	cli "github.com/hatchwayai/hatchway/internal/cli"
 )
 
 func TestGenerateFRPCConfig(t *testing.T) {

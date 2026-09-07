@@ -12,10 +12,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/db"
-	"github.com/zydo/hatchway/internal/testutil"
-	"github.com/zydo/hatchway/internal/tokens"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/db"
+	"github.com/hatchwayai/hatchway/internal/testutil"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 )
 
 // Integration tests for plugin handlers — these need a real DB to exercise

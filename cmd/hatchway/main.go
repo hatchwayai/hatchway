@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/zydo/hatchway/internal/cli/commands"
+	"github.com/hatchwayai/hatchway/internal/cli/commands"
 )
 
 var version = "dev"

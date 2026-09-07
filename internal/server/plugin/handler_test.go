@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/hatchwayai/hatchway/internal/config"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/zydo/hatchway/internal/config"
 )
 
 // stubTransition records calls and returns a configurable error.

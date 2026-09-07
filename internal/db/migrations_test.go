@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
-	"github.com/zydo/hatchway/internal/testutil"
+	"github.com/hatchwayai/hatchway/internal/testutil"
 )
 
 func setupTestDB(t *testing.T) string {

@@ -9,8 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
-	"github.com/zydo/hatchway/internal/db"
-	"github.com/zydo/hatchway/internal/testutil"
+	"github.com/hatchwayai/hatchway/internal/db"
+	"github.com/hatchwayai/hatchway/internal/testutil"
 )
 
 // Internal-package integration tests exercising the unexported reaper and

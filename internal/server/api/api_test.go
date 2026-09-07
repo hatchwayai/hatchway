@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 	"github.com/jackc/pgx/v5"
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/tokens"
 )
 
 func TestWriteError(t *testing.T) {

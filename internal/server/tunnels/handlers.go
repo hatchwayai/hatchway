@@ -14,11 +14,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/server/api"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/server/api"
-	"github.com/zydo/hatchway/internal/tokens"
 )
 
 // CreateTunnelRequest is the strictly decoded POST /v1/tunnels payload.

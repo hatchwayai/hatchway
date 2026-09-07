@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/tokens"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 )
 
 // --- Login tests ---

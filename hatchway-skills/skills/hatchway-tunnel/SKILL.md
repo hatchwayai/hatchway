@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires the hatchway CLI with a bundled or PATH-visible frpc, network access to a self-hosted Hatchway server, and credentials via HATCHWAY_TOKEN/HATCHWAY_SERVER env vars or hatchway auth set-token.
 metadata:
   author: zydo
-  source: https://github.com/zydo/hatchway
+  source: https://github.com/hatchwayai/hatchway
   version: "0.1.0"
 ---
 

@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/zydo/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/config"
 )
 
 // TunnelHostHeader is set by the trusted reverse proxy on tunnel

@@ -15,12 +15,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
-	"github.com/zydo/hatchway/internal/config"
-	"github.com/zydo/hatchway/internal/db"
-	"github.com/zydo/hatchway/internal/server/api"
-	"github.com/zydo/hatchway/internal/server/tunnels"
-	"github.com/zydo/hatchway/internal/testutil"
-	"github.com/zydo/hatchway/internal/tokens"
+	"github.com/hatchwayai/hatchway/internal/config"
+	"github.com/hatchwayai/hatchway/internal/db"
+	"github.com/hatchwayai/hatchway/internal/server/api"
+	"github.com/hatchwayai/hatchway/internal/server/tunnels"
+	"github.com/hatchwayai/hatchway/internal/testutil"
+	"github.com/hatchwayai/hatchway/internal/tokens"
 )
 
 // Integration tests for the API surface that previously had no end-to-end

@@ -1,7 +1,7 @@
 # hatchway-skills
 
 [Agent Skills](https://agentskills.io) for
-[Hatchway](https://github.com/zydo/hatchway), the self-hosted tunnel server —
+[Hatchway](https://github.com/hatchwayai/hatchway), the self-hosted tunnel server —
 so your AI coding agent can expose a local port and hand you a public HTTPS URL
 on **your own domain**, with no SaaS account in the loop.
 
@@ -14,7 +14,7 @@ on **your own domain**, with no SaaS account in the loop.
 ## Prerequisites
 
 - A deployed Hatchway server (see the
-  [self-host guide](https://github.com/zydo/hatchway/blob/main/docs/self-host.md)).
+  [self-host guide](https://github.com/hatchwayai/hatchway/blob/main/docs/self-host.md)).
 - The `hatchway` CLI on the machine where the agent runs, with `frpc` next to
   it or on `PATH`. Release archives bundle both.
 - Credentials: `hatchway auth set-token --server <url> <sk_live_…>`, or the
@@ -29,7 +29,7 @@ and many others).
 **Claude Code** — personal, all projects:
 
 ```bash
-git clone https://github.com/zydo/hatchway-skills.git
+git clone https://github.com/hatchwayai/hatchway-skills.git
 mkdir -p ~/.claude/skills
 cp -r hatchway-skills/skills/hatchway-tunnel ~/.claude/skills/
 ```

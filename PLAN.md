@@ -22,7 +22,7 @@ post-MVP items are proposals, not active API commitments.
 **Goal:** one Go module and one `hatchway` binary with repeatable development
 commands.
 
-- [x] Initialize `github.com/zydo/hatchway`.
+- [x] Initialize `github.com/hatchwayai/hatchway`.
 - [x] Use Cobra for the command tree and `slog` for logging.
 - [x] Add version injection through the Makefile and GoReleaser.
 - [x] Add `build`, `test`, `test-short`, `coverage`, `lint`, `fmt`, and `tidy`

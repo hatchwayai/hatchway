@@ -1,7 +1,7 @@
 # Hatchway reference
 
 Details behind [SKILL.md](../SKILL.md). Upstream documentation:
-[zydo/hatchway](https://github.com/zydo/hatchway) — `docs/cli.md` (commands),
+[hatchwayai/hatchway](https://github.com/hatchwayai/hatchway) — `docs/cli.md` (commands),
 `docs/api.md` (REST contract), `docs/self-host.md` (running a server).
 
 ## Install and prerequisites
@@ -9,7 +9,7 @@ Details behind [SKILL.md](../SKILL.md). Upstream documentation:
 - **Client release archive**: GitHub releases ship `hatchway` with a matching
   `frpc` side by side. The CLI finds `frpc` next to its own binary first, then
   on `PATH`.
-- **From source**: `go install github.com/zydo/hatchway/cmd/hatchway@latest`
+- **From source**: `go install github.com/hatchwayai/hatchway/cmd/hatchway@latest`
   (or clone + `make build`); provide `frpc` separately — any recent frp release
   works, the server pins and tests against frp 0.69.
 - **A deployed Hatchway server** is required. If the user has none and wants

@@ -9,7 +9,7 @@ This repository does not yet have a published release tag. Build the current
 client from source:
 
 ```bash
-git clone https://github.com/zydo/hatchway.git
+git clone https://github.com/hatchwayai/hatchway.git
 cd hatchway
 make build
 ```

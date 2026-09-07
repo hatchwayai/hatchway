@@ -1,13 +1,13 @@
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/zydo/hatchway/main/docs/assets/hatchway_logo.svg"
+    src="https://raw.githubusercontent.com/hatchwayai/hatchway/main/docs/assets/hatchway_logo.svg"
     alt="Hatchway"
     width="480"
   >
 </p>
 
-[![CI](https://github.com/zydo/hatchway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zydo/hatchway/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/github/go-mod/go-version/zydo/hatchway)](go.mod)
+[![CI](https://github.com/hatchwayai/hatchway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hatchwayai/hatchway/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/github/go-mod/go-version/hatchwayai/hatchway)](go.mod)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 CLI-first, self-hosted public HTTP tunnels powered by [frp](https://github.com/fatedier/frp).
@@ -25,7 +25,7 @@ $ hatchway http 3000
 https://t-abc3x7km9w2p4rng.tunnel.example.com
 ```
 
-**For AI agents:** [hatchway-skills](https://github.com/zydo/hatchway-skills)
+**For AI agents:** [hatchway-skills](https://github.com/hatchwayai/hatchway-skills)
 ships an [Agent Skills](https://agentskills.io) package that teaches Claude
 Code, Cursor, Codex, and other agents to use your tunnel server — webhook
 testing and dev-server sharing with no SaaS account in the loop.
@@ -111,7 +111,7 @@ Stripe. See [DESIGN.md](DESIGN.md) for the full trust model.
 ### 1. Configure
 
 ```bash
-git clone https://github.com/zydo/hatchway.git
+git clone https://github.com/hatchwayai/hatchway.git
 cd hatchway
 cp .env.example .env
 ```
@@ -215,7 +215,7 @@ recreate the `public` schema, so they deliberately ignore the service's
 `make build` writes `dist/hatchway`; provide `frpc` separately. Client release
 archives bundle `hatchway` and `frpc` side by side — `make validate-release`
 builds and verifies them locally, and published archives appear on the
-[releases page](https://github.com/zydo/hatchway/releases) (v0.1.0+).
+[releases page](https://github.com/hatchwayai/hatchway/releases) (v0.1.0+).
 
 ## Documentation
 
